@@ -1542,6 +1542,13 @@ impl Coordinator {
     /// Every replica of every shard: its role, health, latest point of
     /// rates and gauges (each server's own, from `Health`'s detail), and
     /// how long it took to answer; and the slots each shard holds.
+    /// Every replica of every shard: its shard, its URL and a client of it
+    /// (to ask each server, as a query of the logs does,
+    /// [`crate::logstore::cluster_query`]).
+    pub fn replica_clients(&self) -> Vec<(usize, String, Client)> {
+        self.replicas.iter().enumerate().flat_map(|(i, rs)| rs.iter().map(move |r| (i, r.url.clone(), r.client.clone()))).collect()
+    }
+
     pub async fn cluster(&self) -> Json {
         let calls = self.replicas.iter().map(|rs| {
             join_all(rs.iter().map(|r| {

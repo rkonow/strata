@@ -14,7 +14,9 @@
 //!   rules over the series.
 //! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves;
 //!   [`telemetry`]: the running and latest queries, their traces, and the
-//!   series of rates and gauges the UI draws.
+//!   series of rates and gauges the UI draws; [`logstore`]: the log lines
+//!   and queries kept in a Strata database of the server's own, and
+//!   searched across a cluster.
 
 pub mod agent;
 pub mod alerts;
@@ -26,6 +28,7 @@ pub mod http;
 pub mod idem;
 pub mod json;
 pub mod keys;
+pub mod logstore;
 pub mod media;
 pub mod metrics;
 pub mod obs;

@@ -292,7 +292,13 @@ pub struct QueryLog {
     recent: Mutex<VecDeque<Arc<Finished>>>,
     slow: Mutex<VecDeque<Arc<Finished>>>,
     pub statements: Statements,
+    /// Also hands every query that ended, and whether it was slow, here:
+    /// the server's log store ([`crate::logstore::LogStore::keep_query`]).
+    pub keep: std::sync::OnceLock<Keep>,
 }
+
+/// Where a [`QueryLog`] hands the queries that end.
+pub type Keep = Box<dyn Fn(&Arc<Finished>, bool) + Send + Sync>;
 
 /// Queries [`QueryLog`] keeps of the latest, and of the slow.
 pub const RECENT: usize = 500;
@@ -300,7 +306,7 @@ pub const SLOW: usize = 200;
 
 impl Default for QueryLog {
     fn default() -> QueryLog {
-        QueryLog { recent: Mutex::new(VecDeque::with_capacity(RECENT)), slow: Mutex::new(VecDeque::new()), statements: Statements::default() }
+        QueryLog { recent: Mutex::new(VecDeque::with_capacity(RECENT)), slow: Mutex::new(VecDeque::new()), statements: Statements::default(), keep: std::sync::OnceLock::new() }
     }
 }
 
@@ -323,6 +329,9 @@ impl QueryLog {
             error: error.map(|e| crate::obs::truncate(e, 500).into_owned()),
             trace: trace().map(|t| t.spans()).unwrap_or_default(),
         });
+        if let Some(keep) = self.keep.get() {
+            keep(&f, slow);
+        }
         push(&self.recent, f.clone(), RECENT);
         if slow {
             push(&self.slow, f, SLOW);

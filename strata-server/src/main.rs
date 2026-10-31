@@ -267,6 +267,28 @@ struct Args {
     /// How to write log lines: text, or json (one object per line).
     #[arg(long, env = "STRATA_LOG_FORMAT", default_value = "text")]
     log_format: String,
+    /// Where the server keeps its log lines and the queries it answered, a
+    /// Strata database of its own searched with SQL (POST /v1/logs/query,
+    /// the UI's Logs): a path, or "off" (default: DB.logs beside --db; a
+    /// coordinator keeps none unless given one, and asks its shards').
+    #[arg(long)]
+    log_store: Option<String>,
+    /// How long the log store keeps rows, as "7 days", "12h" or "2 weeks".
+    #[arg(long, default_value = "7 days")]
+    log_retain: String,
+    /// The most the log store takes on disk, in MiB; past it the oldest
+    /// rows are deleted (0: no limit).
+    #[arg(long, default_value_t = 1024)]
+    log_store_mb: u64,
+    /// Queries a second the log store keeps besides the slow and failed
+    /// ones, which it always keeps (0: only those).
+    #[arg(long, default_value_t = 200)]
+    log_queries: u64,
+    /// This server's name in the log stores' rows (`node`), as a
+    /// coordinator shows its servers' logs (default: the host's name and
+    /// the HTTP port).
+    #[arg(long, env = "STRATA_NODE_NAME")]
+    node_name: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -389,6 +411,10 @@ async fn main() {
         eprintln!("strata-server: {e}");
         std::process::exit(1)
     }
+    // A server's lines go to its log store from the first (it opens later).
+    if a.command.is_none() && a.log_store.as_deref() != Some("off") {
+        obs::sink().start();
+    }
     match &a.command {
         Some(Command::FetchModel { name, models }) => {
             let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
@@ -494,6 +520,14 @@ async fn main() {
         audit_log: a.audit_log,
         alerts: a.alerts,
         alert_webhook: a.alert_webhook.filter(|u| !u.is_empty()),
+        log_store: a.log_store.as_deref().map(|p| (p != "off").then(|| PathBuf::from(p))),
+        node_name: a.node_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| {
+            let port = a.listen.rsplit(':').next().unwrap_or("7700");
+            format!("{}:{port}", strata_server::logstore::hostname())
+        }),
+        log_retain: std::time::Duration::from_secs(strata::schema::Retain::parse_period(&a.log_retain).unwrap_or_else(|e| fail(&format!("--log-retain: {e}"))) as u64),
+        log_store_bytes: a.log_store_mb << 20,
+        log_queries_per_sec: a.log_queries,
         merger: {
             let d = strata::storage::MergerOptions::default();
             strata::storage::MergerOptions {
@@ -541,11 +575,17 @@ async fn main() {
             }
         }));
     }
+    let store = svc.log_store.clone();
     if let Err(e) = server::serve_http(svc, http, access).await {
         fail(&format!("HTTP server: {e}"));
     }
     for t in tasks {
         let _ = t.await;
+    }
+    // The last lines, "stopping" among them, reach the store.
+    if let Some(s) = store {
+        tracing::info!("stopping");
+        s.close();
     }
 }
 

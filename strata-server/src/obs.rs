@@ -4,7 +4,8 @@
 //! names, and a coordinator passes on to its shards.
 //!
 //! Logs go to stderr through `tracing`, as text or as JSON lines
-//! ([`init_logs`]).
+//! ([`init_logs`]), to a ring of the latest ([`ring`]), and to the server's
+//! log store ([`sink`], [`crate::logstore`]), a Strata database of its own.
 
 use std::collections::hash_map::RandomState;
 use std::future::Future;
@@ -157,13 +158,15 @@ pub fn ring() -> &'static LogRing {
 }
 
 impl LogRing {
-    fn push(&self, mut line: LogLine) {
+    fn push(&self, mut line: LogLine) -> Arc<LogLine> {
         let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
         line.seq = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         if lines.len() == RING_LINES {
             lines.pop_front();
         }
-        lines.push_back(Arc::new(line));
+        let line = Arc::new(line);
+        lines.push_back(line.clone());
+        line
     }
 
     /// The lines after number `after` at `min` level or more severe (as
@@ -251,7 +254,7 @@ where
             }
         }
         let m = event.metadata();
-        ring().push(LogLine {
+        let line = ring().push(LogLine {
             seq: 0,
             ts_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
             level: match *m.level() {
@@ -268,6 +271,112 @@ where
             method,
             route,
         });
+        if !QUIET.get() {
+            sink().push(line);
+        }
+    }
+}
+
+// ------------------------------------------------------ the log store's feed
+
+thread_local! {
+    /// Set on the log store's own threads: what they log goes to stderr and
+    /// the ring, not to the store, which storing it would write to again.
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keeps what this thread logs from now on out of the log store
+/// ([`sink`]): for the store's own threads, whose writes and merges log as
+/// any database's do.
+pub fn quiet_thread() {
+    QUIET.set(true);
+}
+
+/// The lines waiting for the log store ([`crate::logstore`]), the oldest
+/// first: every line the server logs once [`Sink::start`] is called (by the
+/// server, before it opens anything), but those of the store's own threads
+/// ([`quiet_thread`]). At most [`SINK_LINES`] wait; more are counted and
+/// dropped, as when the store cannot keep up.
+pub struct Sink {
+    state: Mutex<SinkState>,
+    ready: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct SinkState {
+    on: bool,
+    lines: std::collections::VecDeque<Arc<LogLine>>,
+    dropped: u64,
+}
+
+/// Lines the [`sink`] holds for the store.
+pub const SINK_LINES: usize = 100_000;
+
+/// Lines that wake the store's writer before its next second.
+pub const SINK_BATCH: usize = 4096;
+
+/// The lines waiting for the log store.
+pub fn sink() -> &'static Sink {
+    static SINK: OnceLock<Sink> = OnceLock::new();
+    SINK.get_or_init(|| Sink { state: Mutex::new(SinkState::default()), ready: std::sync::Condvar::new() })
+}
+
+impl Sink {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SinkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Keeps lines for the store from now on.
+    pub fn start(&self) {
+        self.lock().on = true;
+    }
+
+    /// Keeps none, and lets go of those held: the server keeps no store.
+    pub fn stop(&self) {
+        let mut s = self.lock();
+        s.on = false;
+        s.lines = Default::default();
+    }
+
+    fn push(&self, line: Arc<LogLine>) {
+        let mut s = self.lock();
+        if !s.on {
+            return;
+        }
+        if s.lines.len() >= SINK_LINES {
+            s.dropped += 1;
+            return;
+        }
+        s.lines.push_back(line);
+        if s.lines.len() == SINK_BATCH {
+            self.ready.notify_all();
+        }
+    }
+
+    /// Waits until [`SINK_BATCH`] lines wait or `timeout` passes.
+    pub fn wait(&self, timeout: Duration) {
+        let s = self.lock();
+        if s.lines.len() < SINK_BATCH {
+            drop(self.ready.wait_timeout(s, timeout).unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+
+    /// Wakes a writer in [`Sink::wait`] (the store is closing).
+    pub fn wake(&self) {
+        self.ready.notify_all();
+    }
+
+    /// The oldest `max` lines waiting, taken.
+    pub fn take(&self, max: usize) -> Vec<Arc<LogLine>> {
+        let mut s = self.lock();
+        let n = s.lines.len().min(max);
+        s.lines.drain(..n).collect()
+    }
+
+    /// Lines waiting, and lines dropped because too many waited.
+    pub fn counts(&self) -> (usize, u64) {
+        let s = self.lock();
+        (s.lines.len(), s.dropped)
     }
 }
 

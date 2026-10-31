@@ -164,6 +164,10 @@ pub struct Service {
     pub keys: Arc<Keys>,
     pub audit: Audit,
     pub alerts: Alerts,
+    /// The server's log store ([`crate::logstore`]): its log lines and the
+    /// queries it answered, in a Strata database of their own (`None`:
+    /// `--log-store off`, or a coordinator without one).
+    pub log_store: Option<Arc<crate::logstore::LogStore>>,
     /// The embedded VECTOR fields' models, of every table
     /// ([`Service::open_models`], [`Service::models`]).
     models: RwLock<Arc<Vec<FieldModel>>>,
@@ -271,6 +275,7 @@ impl Service {
             keys: Arc::new(Keys::memory()),
             audit: Audit::new(None).expect("an audit log in memory"),
             alerts: Alerts::new(None, None).expect("the default alert rules"),
+            log_store: None,
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
             ranking: Models::default(),
@@ -1219,7 +1224,10 @@ impl Service {
         match bound {
             Ok((schema, select)) => self.select(req, schema, select, t0, timeout).await,
             Err(e) => {
-                self.metrics.query("invalid", "error", t0.elapsed().as_secs_f64());
+                let secs = t0.elapsed().as_secs_f64();
+                self.metrics.query("invalid", "error", secs);
+                // Kept with its error, as a query that ran and failed is.
+                self.query_log.add(&req.sql, "invalid", "error", secs, 0, req.shard, Some(&e.message), false);
                 Err(e)
             }
         }
@@ -2248,7 +2256,8 @@ impl Service {
     pub async fn detail(self: &Arc<Self>) -> Json {
         let health = self.health().await;
         let load = self.series.last().map(|p| (*p).clone());
-        json!({"health": health, "load": load, "system": {"version": env!("CARGO_PKG_VERSION"), "uptime_s": self.started.elapsed().map_or(0.0, |d| d.as_secs_f64()), "cores": self.cores}, "running": self.live.len()})
+        let log_store = self.log_store.as_ref().map(|s| s.status());
+        json!({"health": health, "load": load, "system": {"version": env!("CARGO_PKG_VERSION"), "uptime_s": self.started.elapsed().map_or(0.0, |d| d.as_secs_f64()), "cores": self.cores}, "running": self.live.len(), "log_store": log_store})
     }
 
     /// The metrics (`GET /metrics`). A coordinator does not ask its shards
@@ -2260,6 +2269,9 @@ impl Service {
             Family { name: "strata_alerts_firing", ty: "gauge", help: "Alerts firing now, by severity (GET /v1/alerts).", values: self.alerts.firing() },
             one("strata_api_keys", "gauge", "API keys the server holds (GET /v1/admin/keys).", self.keys.list().len() as f64),
         ];
+        if let Some(s) = &self.log_store {
+            more.extend(s.metrics());
+        }
         if let Some(b) = &self.query_memory {
             more.extend([
                 one("strata_query_memory_bytes", "gauge", "Memory the running queries hold, as counted against their budget.", b.used() as f64),

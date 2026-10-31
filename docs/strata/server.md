@@ -68,6 +68,11 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--log FILTER` | `$STRATA_LOG`, else `info` | what to [log](#logs): a level (`error`, `warn`, `info`, `debug`, `trace`), or levels per module (`info,strata=debug`); `debug` logs every request |
 | `--log-format F` | `$STRATA_LOG_FORMAT`, else `text` | log lines as `text` or `json` (one object per line) |
 | `--slow-ms N` | 1000 | log queries and writes that take this many milliseconds or more, with their SQL (0: none) |
+| `--log-store PATH` | `DB.logs` beside the database; none on a coordinator | the [log store](#the-log-store-logs-kept-in-strata): a Strata database where the server keeps its log lines and queries, searched with SQL; `off` for none |
+| `--log-retain PERIOD` | `7 days` | how long the log store keeps a line or a query (`'12h'`, `'2 weeks'`) |
+| `--log-store-mb N` | 1024 | the most the log store may take on disk; past it the oldest go |
+| `--log-queries N` | 200 | the queries a second the log store keeps of those that ended well and took less than `--slow-ms`; every slow or failed one is kept |
+| `--node-name NAME` | `$STRATA_NODE_NAME`, else `HOST:PORT` (the host name and the HTTP port) | what the log store calls this server, in its `node` column |
 
 `strata-server import`, `strata-server fetch-model` and `strata-server promote` are subcommands: [loading rows](#loading-rows), [embedded vector fields](#embedded-vector-fields) and [promotion](#replication-a-primary-and-its-replicas).
 
@@ -715,6 +720,30 @@ A coordinator's `/metrics` does not ask its shards: each shard serves its own, a
 
 The server logs to stderr, as text or, with `--log-format json`, one JSON object per line (`timestamp`, `level`, `target`, `message`, the event's fields, and `span` with the request's `id`, method and route). Every line written while serving a request names its id. At the default level, `info`, it logs what it opened and where it listens, a query or write that took `--slow-ms` or more (`slow query`, with its kind, outcome, rows and SQL, cut to 2,000 bytes; `slow write`, with the rows written and the SQL of an `INSERT`, `UPDATE` or `DELETE`; parameters are not logged), a request that failed on the server's side (status 500 and up, at most ten lines a second, with how many were held back), a merge or background flush that failed, and a database that stopped accepting writes. `debug` adds a line for every request answered (`answered`, with its status and duration), and the engine's flushes and merges. The libraries the server is built on log only warnings unless the filter names them (`--log info,h2=debug`).
 
+### The log store: logs kept in Strata
+
+A server also keeps what it logs, and the queries it answers, in a Strata database of their own: its log store, `DB.logs` beside the database it serves (`--log-store PATH`; `off` for none). A coordinator keeps one only when `--log-store` names it. It holds two tables:
+
+- `logs`, a line a row: `id`, its time (`ts`, a `TIMESTAMP`, and `minute` and `hour`, whole minutes and hours since 1970, to `GROUP BY`), the server it was logged on (`node`, `--node-name`), `level` (`error`, `warn`, `info`, `debug`, `trace`), `target` (the module), `message`, the event's other fields as JSON text (`fields`), and the request it was logged for (`request_id`, `method`, `route`). A line's `status`, `error` and time (`ms`) are also columns of their own.
+- `queries`, a query a row: `id`, `ts`, `minute`, `hour`, `node`, `request_id`, `kind`, `outcome`, whether it was a shard's part of a coordinator's query (`shard`), its `sql`, its statement's shape (`fingerprint`, as `/v1/queries/stats` groups them), `ms`, `n_rows`, `error`, and the rest of what the query log keeps of it, its trace among it, as a JSON object (`detail`). Every slow or failed query is kept, and of the others at most `--log-queries` a second.
+
+They are searched with SQL like any table, `POST /v1/logs/query {"sql": "...", "params": {...}}` (or the gRPC call `Logs`, with an admin key), with `MATCH` and `bm25` over the text, `GROUP BY` over the levels, nodes and minutes, and joins between the two:
+
+```sql
+SELECT ts, node, level, message FROM logs
+WHERE level IN ('warn', 'error') AND MATCH(message, 'replica OR shard') AND ts > '2026-10-31T06:00:00Z'
+ORDER BY ts DESC LIMIT 100;
+SELECT minute, level, COUNT(*) FROM logs WHERE ts > '2026-10-31' GROUP BY minute, level;
+SELECT fingerprint, COUNT(*) AS n, SUM(ms), MAX(ms) FROM queries WHERE shard = false GROUP BY fingerprint ORDER BY 3 DESC LIMIT 20;
+SELECT ts, route, status, ms FROM logs WHERE request_id = '9f2c41d07a3e88b1';
+```
+
+A coordinator answers for the whole cluster: it asks every replica of every shard (the `Logs` call, as a shard's part) and its own store, and merges their answers as it merges its shards', so `COUNT(*)` and `GROUP BY` count every server and `ORDER BY ts` interleaves their lines. The answer's `nodes` gives each server's rows and time, or its error: a server that does not answer is named there, and the answer goes on without it (an older server, without a store, answers 501). Such a search reads one table; a join or a subquery runs on one server's store (`"scope": "local"`, the coordinator's own). `GET /v1/logs/store` gives the store (its path, rows, size, retention, what it wrote, dropped and deleted), its tables, and on a coordinator every server's store; `/v1/cluster` shows each replica's under `detail.log_store`.
+
+A writer thread writes what waits every second, or as soon as 4,096 lines wait, in one transaction it does not sync: a crash of the process loses nothing written, a power cut the latest lines. Up to 100,000 lines wait in memory; past that the newest are dropped and counted. Every 30 seconds the store deletes the rows older than `--log-retain` and, while it takes more than `--log-store-mb`, the oldest quarter of what is left, then merges, which frees their pages. Reading the logs writes none: what the store's own threads log (its writes, flushes and merges) stays out of it, its searches are not queries of the server's, and the log viewer's requests are not logged as answered. The store is a database like any other, so it can be opened on its own, by a server (`--db app.strata.logs --log-store off`), from Python or with `strata-server export` while no server holds it.
+
+The metrics name it `strata_log_store_*`: `rows{table}`, `written_total{table}`, `bytes`, `waiting_lines`, `dropped_total{reason}` (`lines` past the waiting limit, `queries` past it, `failed` writes, `sampled` queries over `--log-queries`) and `deleted_total{reason}` (`expired`, `size`).
+
 ### What the server is doing now
 
 Beside `/metrics`, a server keeps what an operator (and the [UI](#the-ui)) needs to see what it is doing, in memory, without a Prometheus to scrape it:
@@ -751,7 +780,7 @@ A local database merges its segments on merger threads as writes add them ([how 
 - **Performance** charts queries (rate, latency percentiles, a latency heatmap, refusals), writes, resources, storage and replication over the range; drag across a chart to zoom every chart to that span. Tables rank the routes, query kinds and gRPC calls, and a tuning advisor reads the numbers and says what to change (a merge, a vacuum, `--max-concurrent`, `--query-memory-mb`, `cluster_by`, a `LIMIT`).
 - **Alerts** lists the rules with each one's metric over the range and its threshold, a timeline of when rules fired, and the events. Drag a rule to reorder it, switch it off, or edit it: pick the metric, drag its threshold on the chart, and see how often it would have fired over the range before saving.
 - **Queries** shows the running queries (cancel one), the latest and the slow ones, and the statements by total time. A dot per query plots latency against time; click one for its SQL, its plan as a waterfall of spans across shards, the other queries of the same request and its log lines.
-- **Logs** follows the server's latest lines, by level, text or request id, with the rate of lines by level, and changes what the server logs while it runs (`PUT /v1/logs/filter`).
+- **Logs** searches the [log store](#the-log-store-logs-kept-in-strata), every server's on a coordinator. **Lines** filters by time (drag across the chart of lines a minute to zoom), level, text (`MATCH` over the message and fields), request id, server, module and route, with the most common of each beside them; open a line for its fields, the lines around it on its server, or its request's lines and queries. **Queries** shows how many ended how, the statements that took the most time in all, and each query with its trace and every server's part of its request. **SQL** runs any query over `logs` and `queries`, with examples, completion, a chart and the plan of each server's part; each tab opens its own search there to change. **Live tail** follows the server's latest lines in memory, with or without a store. The page changes what the server logs while it runs (`PUT /v1/logs/filter`).
 - **Access** says who you are, checks the server's posture (a token, keys, loopback, TLS), makes keys with a scope and an expiry (showing the secret once), revokes them, and reads the audit log.
 - **System** shows the process, the database and its disk, the limits and the configuration, the segments and merges, the operations (check, vacuum, checkpoint, verify replicas, reset statistics) and the `/metrics` text with a filter.
 - **SQL workbench** is an editor in tabs that completes tables, fields (after an alias too), functions and parameters as you type, marks where the server stopped reading a statement and offers the field it may have meant. Parameters get a form, where a vector parameter can be a text the server embeds. The answer is a grid with each row's score as a bar, a chart of any numeric columns, the plan as a tree with what ran on each segment, the trace, and the JSON; it exports as TSV, CSV or JSON Lines. The sidebar lists the tables and fields to drag into the editor, with snippets written for the table's own fields; history and saved queries stay in the browser, and a link opens a query (`#/sql?q=...`).
@@ -765,6 +794,8 @@ A local database merges its segments on merger threads as writes add them ([how 
 - **Media search** finds images (or sounds) by a description, by a file dropped on the page, or by a row (more like this), over a vector embedded from a `MEDIA` field, with the caption's words mixed in by a slider, a keyword field's values and the colours a model named as filters. Results are a grid of the files (`GET /v1/media/<sha256>`) with their rank and score; the map lays every row out by its vector's two main directions, the hits and the query among them.
 - **Graph explorer** draws rows as nodes and their links as edges (an edge table, an `EDGES` field, or a vector field's nearest rows), laid out by forces: drag a node to pin it, scroll to zoom. Search to add nodes, open one to add its neighbours (`REACHABLE`), rank the graph from it with personalized PageRank (`ppr`), and shift-click another, or type its key, for the shortest path (`PATH`); colour and size follow fields, and each walk shows its SQL.
 - **Query console** is the earlier UI, below (`#/classic`).
+
+![Logs: every server's lines kept in Strata, a shard's outage and its return, by level, server and module](../assets/img/strata-command-center-logs.png)
 
 ![The SQL workbench: completion, the answer with scores, the plan](../assets/img/strata-command-center-sql.png)
 

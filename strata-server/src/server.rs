@@ -121,6 +121,18 @@ pub struct Options {
     pub alerts: Option<PathBuf>,
     /// Post alerts that fire or resolve to this URL.
     pub alert_webhook: Option<String>,
+    /// The log store ([`crate::logstore`]): `None` beside the database
+    /// (`<db>.logs`), and none on a coordinator; `Some(None)` none.
+    pub log_store: Option<Option<PathBuf>>,
+    /// The name this server's rows carry in log stores (empty: the host's
+    /// name and the HTTP port, [`crate::logstore::hostname`]).
+    pub node_name: String,
+    /// Log store rows kept this long (zero: 7 days).
+    pub log_retain: Duration,
+    /// The most bytes the log store takes (0: no limit).
+    pub log_store_bytes: u64,
+    /// Queries a second the log store keeps besides slow and failed ones.
+    pub log_queries_per_sec: u64,
 }
 
 /// How writes resolve MEDIA values, from `--media-fetch`,
@@ -326,10 +338,42 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             tracing::info!("replica: applies the writes its primary ships, and takes none from clients");
         }
     }
+    open_log_store(&mut svc, o)?;
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
     spawn_sampler(&svc);
     Ok(svc)
+}
+
+/// Opens the server's log store ([`crate::logstore`]), beside the database
+/// unless `o.log_store` says where or that there is none, and hands it the
+/// service's queries; a coordinator keeps one only where told. Without one
+/// the lines kept for it are let go ([`obs::Sink::stop`]).
+fn open_log_store(svc: &mut Service, o: &Options) -> Result<(), String> {
+    let path = match &o.log_store {
+        Some(p) => p.clone(),
+        None => o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::logstore::file_of),
+    };
+    let Some(path) = path else {
+        crate::obs::sink().stop();
+        return Ok(());
+    };
+    let node = match o.node_name.is_empty() {
+        true => crate::logstore::hostname(),
+        false => o.node_name.clone(),
+    };
+    let mut lo = crate::logstore::LogOptions::new(path, node);
+    if !o.log_retain.is_zero() {
+        lo.retain = o.log_retain;
+    }
+    lo.max_bytes = o.log_store_bytes;
+    lo.queries_per_sec = o.log_queries_per_sec;
+    let store = crate::logstore::LogStore::open(lo)?;
+    tracing::info!(path = %store.options().path.display(), node = %store.options().node, retain_s = store.options().retain.as_secs(), max_mib = store.options().max_bytes >> 20, "keeps its logs in a log store");
+    let keep = store.clone();
+    let _ = svc.query_log.keep.set(Box::new(move |q, slow| keep.keep_query(q, slow)));
+    svc.log_store = Some(store);
+    Ok(())
 }
 
 /// Asks the replica serving HTTP at `url` to become the primary of a new

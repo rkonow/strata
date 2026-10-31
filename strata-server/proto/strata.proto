@@ -31,6 +31,12 @@
 // them answers Unimplemented; `Hello` names a server's role, which an
 // older one leaves out (STANDALONE).
 //
+// Logs take no protocol version: a server keeps the lines it logs and the
+// queries it answers in a Strata database of its own (its log store, tables
+// `logs` and `queries`), and `Logs` runs a query of it; a coordinator asks
+// every replica of every shard in shard mode and merges their answers, and
+// a server from before it answers Unimplemented.
+//
 // Tables take no protocol version either: a server names every table it
 // serves in `Schema` (`tables_json`), which a server from before tables
 // leaves out, and a coordinator serves the tables that every replica of
@@ -93,6 +99,11 @@ service Strata {
   // compares with its own at the same transaction. Answered once a
   // version.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
+  // A query of this server's log store (tables `logs` and `queries`): SQL
+  // and its params, with `shard` for an answer a coordinator merges with
+  // the other servers'. FailedPrecondition when the server keeps none
+  // (--log-store off). Needs the admin scope.
+  rpc Logs(QueryRequest) returns (QueryResponse);
 }
 
 message RestoreChunk {

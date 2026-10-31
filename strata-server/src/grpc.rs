@@ -193,14 +193,19 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 
 /// Refuses a call its credential may not make ([`crate::keys`]): the
 /// internal methods only the root may (the token the servers of a
-/// cluster share), writes a write or admin key, the rest any key.
+/// cluster share), writes a write or admin key, the log store an admin
+/// key (it shows every client's SQL), the rest any key.
 fn may_call<T>(req: &Request<T>, method: &str) -> Result<(), Status> {
     let who = req.extensions().get::<Principal>().cloned().unwrap_or_else(Principal::open);
     let internal = matches!(method, "Replicate" | "Restore" | "Verify" | "Slots");
     if internal && !who.root {
         return Err(Status::permission_denied(format!("{method} is a call between the servers of a cluster: it needs the token they share, not a key ({:?})", who.name)));
     }
-    let need = if matches!(method, "Write" | "WriteStream") { Scope::Write } else { Scope::Read };
+    let need = match method {
+        "Write" | "WriteStream" => Scope::Write,
+        "Logs" => Scope::Admin,
+        _ => Scope::Read,
+    };
     who.may(need, method).map_err(|e| Status::permission_denied(e.message))
 }
 
@@ -224,7 +229,11 @@ impl Grpc {
         let _in = span.enter();
         let (code, r) = match r {
             Ok(x) => {
-                tracing::debug!(secs, "answered");
+                // A coordinator's query of the logs, as the viewer's own
+                // requests over HTTP, is not logged ([`crate::logstore`]).
+                if method != "Logs" {
+                    tracing::debug!(secs, "answered");
+                }
                 ("Ok", Ok(Response::new(x)))
             }
             Err(e) => {
@@ -258,6 +267,15 @@ impl pb::strata_server::Strata for Grpc {
             svc.check_epoch(r.epoch)?;
             let a = svc.query(query_req(r)?).await?;
             Ok(pb::QueryResponse { snapshot: a.lease, ..result_to_pb(&a.rs, a.took_ms) })
+        })
+        .await
+    }
+
+    async fn logs(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::QueryResponse>, Status> {
+        self.serve("Logs", req, |svc, r| async move {
+            let store = svc.log_store.clone().ok_or_else(crate::logstore::none_here)?;
+            let (rs, took_ms) = store.query(&r.sql, &params_from_pb(r.params), r.shard, svc.timeout_of(r.timeout_ms as u64)).await?;
+            Ok(result_to_pb(&rs, took_ms))
         })
         .await
     }
