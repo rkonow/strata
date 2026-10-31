@@ -32,6 +32,7 @@ pub mod metrics;
 pub mod obs;
 pub mod plan_pb;
 pub mod profiler;
+pub mod profiling;
 pub mod replication;
 pub mod server;
 pub mod service;
@@ -89,6 +90,7 @@ impl From<tonic::Status> for ApiError {
             Code::DeadlineExceeded => 504,
             Code::ResourceExhausted => 429,
             Code::Unavailable => 503,
+            Code::Unimplemented => 501,
             _ => 502,
         };
         ApiError { status, message: s.message().to_string() }
@@ -106,6 +108,8 @@ impl From<ApiError> for tonic::Status {
             // Too many queries running: another replica would only be
             // loaded more ([`crate::coord`] does not retry it elsewhere).
             429 => Code::ResourceExhausted,
+            // Not on this server: a profile without its sampler.
+            501 => Code::Unimplemented,
             503 => Code::Unavailable,
             504 => Code::DeadlineExceeded,
             _ => Code::Internal,

@@ -342,6 +342,8 @@ struct Read {
     epoch: u64,
     /// The write each shard's answer must see ([`Coordinator::after`]).
     after: Vec<u64>,
+    /// Ask each shard for its steps' CPU time (`QueryRequest.profile`).
+    profile: bool,
 }
 
 impl Read {
@@ -354,12 +356,17 @@ impl Read {
             (true, Some(p)) => Some(plan_pb::to_pb_plan(p)),
             (true, None) => Some(plan_pb::to_pb_plan(&typed()?)),
         };
-        Ok(Read { sql: sql.to_string(), params: params_to_pb(params), plan_json: plan_json(given)?, plan, epoch, after: Vec::new() })
+        Ok(Read { sql: sql.to_string(), params: params_to_pb(params), plan_json: plan_json(given)?, plan, epoch, after: Vec::new(), profile: false })
     }
 
     /// The read, seeing the writes `after` names, one per shard.
     fn after(self, after: Vec<u64>) -> Read {
         Read { after, ..self }
+    }
+
+    /// The read, its steps' CPU time measured on each shard.
+    fn profiled(self, profile: bool) -> Read {
+        Read { profile, ..self }
     }
 
     /// The number of the write shard `i`'s answer must see (0: none).
@@ -374,9 +381,9 @@ impl Read {
         match (&self.plan, protocol >= 2) {
             (Some(plan), true) => {
                 let epoch = if protocol >= 4 { self.epoch } else { 0 };
-                pb::QueryRequest { sql: self.sql.clone(), protocol, plan: Some(plan.clone()), epoch, min_seq_no, ..Default::default() }
+                pb::QueryRequest { sql: self.sql.clone(), protocol, plan: Some(plan.clone()), epoch, min_seq_no, profile: self.profile, ..Default::default() }
             }
-            _ => pb::QueryRequest { sql: self.sql.clone(), params: self.params.clone(), plan_json: self.plan_json.clone(), protocol: 1, min_seq_no, ..Default::default() },
+            _ => pb::QueryRequest { sql: self.sql.clone(), params: self.params.clone(), plan_json: self.plan_json.clone(), protocol: 1, min_seq_no, profile: self.profile, ..Default::default() },
         }
     }
 }
@@ -1099,7 +1106,7 @@ impl Coordinator {
             Some(p) => (&none, Some(p)),
             None => (&req.params, req.plan.as_deref()),
         };
-        let read = &Read::new(&req.sql, params, given, protocol, self.epoch(), || Ok(Plan::of_select(schema, select)))?.after(self.after(&req.after)?);
+        let read = &Read::new(&req.sql, params, given, protocol, self.epoch(), || Ok(Plan::of_select(schema, select)))?.after(self.after(&req.after)?).profiled(req.profile);
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
         let ranked_text = strata::cluster::scores_bm25(select);
         // Per shard: the replica holding a lease for this query, and the lease.
@@ -1193,12 +1200,12 @@ impl Coordinator {
                     keys[*i].push(k.clone());
                 }
                 match model {
-                    false => self.fetch(&req.sql, schema, select, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &stats_json, &mut failed).await?,
+                    false => self.fetch(&req.sql, schema, select, ranked, &held, keys, (start, deadline, protocol, partial), read, &stats_json, &mut failed).await?,
                     // The model phase's rows with their text, then the
                     // model, off the async threads.
                     true => {
                         let with = strata::cluster::with_texts(select);
-                        let rows = self.fetch(&req.sql, schema, &with, ranked, &held, keys, (start, deadline, protocol, partial), &read.after, &stats_json, &mut failed).await?;
+                        let rows = self.fetch(&req.sql, schema, &with, ranked, &held, keys, (start, deadline, protocol, partial), read, &stats_json, &mut failed).await?;
                         let select = select.clone();
                         let check = move || match Instant::now() < deadline {
                             true => Ok(()),
@@ -1279,7 +1286,7 @@ impl Coordinator {
         held: &[(usize, usize, u64)],
         mut keys: Vec<Vec<Value>>,
         (start, deadline, protocol, partial): (usize, Instant, u32, bool),
-        after: &[u64],
+        query: &Read,
         stats_json: &[u8],
         failed: &mut [Option<ApiError>],
     ) -> Result<ResultSet, ApiError> {
@@ -1289,7 +1296,7 @@ impl Coordinator {
             if !keys[i].is_empty() {
                 let q = strata::cluster::fetch(select, schema, std::mem::take(&mut keys[i]))?;
                 let plan = Plan::of_select(schema, &q);
-                reads.push((i, r, lease, Read::new(sql, &Params::new(), Some(&plan), protocol, self.epoch(), || Ok(plan.clone()))?.after(after.to_vec())));
+                reads.push((i, r, lease, Read::new(sql, &Params::new(), Some(&plan), protocol, self.epoch(), || Ok(plan.clone()))?.after(query.after.clone()).profiled(query.profile)));
             } else if lease != 0 {
                 let mut c = self.replicas[i][r].client.clone();
                 tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(5), c.release(pb::ReleaseRequest { snapshots: vec![lease] })).await });
@@ -1598,6 +1605,34 @@ impl Coordinator {
             }
         }
         Ok(least.into_iter().filter(|(_, (.., k))| *k == n).map(|(name, (offset, updated, _))| Source { name, offset, updated: (updated != 0).then_some(updated) }).collect())
+    }
+
+    /// A profile of `node`, one replica of a shard named by its URL as
+    /// given (and as [`Self::cluster`] lists it), taken by that server
+    /// ([`crate::profiling::take`]) over gRPC (`Profile`). Its JSON answer
+    /// says which node it is of.
+    pub async fn profile(&self, node: &str, a: crate::profiling::Asked) -> Result<crate::profiling::Answer, ApiError> {
+        use crate::profiling::Answer;
+        let Some(r) = self.replicas.iter().flatten().find(|r| r.url == node) else {
+            return Err(ApiError { status: 404, message: format!("no server {node} in this cluster: GET /v1/cluster lists each replica's url") });
+        };
+        let mut c = r.client.clone();
+        let req = pb::ProfileRequest { kind: a.kind.name().into(), body_json: if a.body.is_null() { Vec::new() } else { a.body.to_string().into_bytes() }, folded: a.folded, in_use: a.in_use };
+        let wait = a.kind.wait(&a.body);
+        let answered = match tokio::time::timeout(wait, c.profile(req)).await {
+            Err(_) => return Err(ApiError { status: 504, message: format!("{node} took no profile within {} s", wait.as_secs()) }),
+            Ok(Err(s)) if s.code() == Code::Unimplemented && s.message().is_empty() => return Err(ApiError { status: 501, message: format!("{node} takes no profile over gRPC: its server is older than this coordinator's") }),
+            Ok(r) => r?.into_inner(),
+        };
+        if a.folded {
+            let file = if a.kind == crate::profiling::Kind::Heap { "strata-heap.folded" } else { "strata-cpu.folded" };
+            return Ok(Answer::Folded(file, String::from_utf8_lossy(&answered.body).into_owned()));
+        }
+        let mut j: Json = serde_json::from_slice(&answered.body).map_err(|e| ApiError { status: 502, message: format!("{node} answered a profile that is not JSON: {e}") })?;
+        if let Some(o) = j.as_object_mut() {
+            o.insert("node".into(), json!(node));
+        }
+        Ok(Answer::Json(j))
     }
 
     /// "ok" when every replica answers, "degraded" when every shard still

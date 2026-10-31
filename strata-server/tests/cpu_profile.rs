@@ -66,7 +66,9 @@ async fn a_cpu_profile_samples_the_server_s_threads() {
     // The executor's frames are named (the binary keeps its symbols).
     let strata: u64 = stacks.iter().filter(|s| s["frames"].as_array().unwrap().iter().any(|f| { let n = names[f.as_u64().unwrap() as usize]; n.starts_with("strata::") || n.starts_with("<strata::") })).map(|s| s["samples"].as_u64().unwrap()).sum();
     assert!(strata * 4 >= samples, "{strata} of {samples} samples in strata: {:?}", &names[..names.len().min(40)]);
-    assert!(!names.iter().any(|n| n.rfind("::h").is_some_and(|i| n.len() - i == 19)), "hashes left: {names:?}");
+    // A hash is "::h" and 16 hex digits at the end, as `profiler::clean`
+    // takes it off; "::h1::role::Server>" (hyper) is the same length.
+    assert!(!names.iter().any(|n| n.rfind("::h").is_some_and(|i| n.len() - i == 19 && n[i + 3..].bytes().all(|b| b.is_ascii_hexdigit()))), "hashes left: {names:?}");
     // Where the C library is sampled (glibc 2.35 and up), its time shows:
     // a query allocates and copies.
     let blocked: Vec<&str> = p["blocked"].as_array().unwrap().iter().map(|b| b.as_str().unwrap()).collect();

@@ -140,8 +140,9 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         hold: r.hold,
         release: r.release,
         after: After::of(r.min_seq_no, r.min_seq_nos)?,
-        // A shard measures CPU time when set to for every query.
-        profile: false,
+        // A coordinator's query that asked for its steps' CPU time; a shard
+        // also measures it when set to for every query.
+        profile: r.profile,
         quiet: false,
     })
 }
@@ -196,14 +197,19 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 
 /// Refuses a call its credential may not make ([`crate::keys`]): the
 /// internal methods only the root may (the token the servers of a
-/// cluster share), writes a write or admin key, the rest any key.
+/// cluster share), writes a write or admin key, profiles an admin key (as
+/// `/v1/profile` over HTTP), the rest any key.
 fn may_call<T>(req: &Request<T>, method: &str) -> Result<(), Status> {
     let who = req.extensions().get::<Principal>().cloned().unwrap_or_else(Principal::open);
     let internal = matches!(method, "Replicate" | "Restore" | "Verify" | "Slots");
     if internal && !who.root {
         return Err(Status::permission_denied(format!("{method} is a call between the servers of a cluster: it needs the token they share, not a key ({:?})", who.name)));
     }
-    let need = if matches!(method, "Write" | "WriteStream") { Scope::Write } else { Scope::Read };
+    let need = match method {
+        "Write" | "WriteStream" => Scope::Write,
+        "Profile" => Scope::Admin,
+        _ => Scope::Read,
+    };
     who.may(need, method).map_err(|e| Status::permission_denied(e.message))
 }
 
@@ -427,6 +433,15 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("Release", req, |svc, r| async move {
             svc.release(&r.snapshots);
             Ok(pb::Empty {})
+        })
+        .await
+    }
+
+    async fn profile(&self, req: Request<pb::ProfileRequest>) -> Result<Response<pb::ProfileResponse>, Status> {
+        self.serve("Profile", req, |svc, r| async move {
+            let body: serde_json::Value = if r.body_json.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&r.body_json).map_err(|e| ApiError::bad(format!("bad profile body: {e}")))? };
+            let asked = crate::profiling::Asked { kind: crate::profiling::Kind::of(&r.kind)?, body, folded: r.folded, in_use: r.in_use };
+            Ok(pb::ProfileResponse { body: crate::profiling::take(&svc, asked).await?.bytes() })
         })
         .await
     }

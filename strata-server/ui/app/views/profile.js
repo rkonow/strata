@@ -26,14 +26,18 @@ function render(page, r) {
   const tabs = h("div", { class: "tabs", role: "tablist" });
   const body = h("div");
   page.append(h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Profiler"), h("p", {}, "Where the time and memory go: every step of a query, on which segment, thread and shard; the server's CPU by function; its heap by where it was allocated; and its threads."))), tabs, body);
-  let tab = null, stop = null, view = null;
+  let tab = null, node = null, stop = null, view = null;
   function go(params) {
     const t = params.get("tab") || (params.get("id") ? "recent" : "query");
-    if (t !== tab) {
-      tab = t; stop?.();
-      clear(tabs, TABS.map(([k, v]) => h("button", { role: "tab", "aria-selected": String(k === t), onclick: () => { location.hash = "#/profile?tab=" + k; } }, v)));
+    // On a coordinator, the CPU and Memory tabs profile any server of its
+    // cluster: ?node= names it (a replica's URL), none the coordinator.
+    const n = t === "cpu" || t === "memory" ? params.get("node") || "" : "";
+    if (t !== tab || n !== node) {
+      tab = t; node = n; stop?.();
+      clear(tabs, TABS.map(([k, v]) => h("button", { role: "tab", "aria-selected": String(k === t), onclick: () => { location.hash = "#/profile?tab=" + k + (node && (k === "cpu" || k === "memory") ? "&node=" + encodeURIComponent(node) : ""); } }, v)));
       clear(body);
-      view = t === "query" ? runner(body) : t === "cpu" ? cpu(body) : t === "memory" ? memory(body) : ended(body, t);
+      if (t === "cpu" || t === "memory") body.append(nodePicker(t, n));
+      view = t === "query" ? runner(body) : t === "cpu" ? cpu(body, n) : t === "memory" ? memory(body, n) : ended(body, t);
       stop = view.stop;
     }
     view.open?.(params);
@@ -120,6 +124,34 @@ const EVERY = [[64 << 10, "64 KB"], [512 << 10, "512 KB"], [2 << 20, "2 MB"]];
 const everyName = (n) => EVERY.find((e) => e[0] === n)?.[1] || fmt.bytes(n);
 const CLIENTS = [[1, "1"], [4, "4"], [16, "16"]];
 
+/** The query string that sends a profile to a node of the cluster. */
+const onNode = (node) => node ? "?node=" + encodeURIComponent(node) : "";
+
+/**
+ * On a coordinator, which server of its cluster the tab profiles: the
+ * coordinator itself, or any replica of any shard, which takes the
+ * profile itself, asked through the coordinator. Hidden on any other server.
+ */
+function nodePicker(tab, node) {
+  const el = h("div", { class: "row", style: { gap: "10px", flexWrap: "wrap", marginBottom: "14px", display: "none" } });
+  api("/v1/cluster").then((c) => {
+    if (c.role !== "coordinator") return;
+    const opts = [h("option", { value: "", selected: !node }, "this coordinator")];
+    let found = !node;
+    for (const s of c.shards || []) for (const r of s.replicas || []) {
+      const role = r.role && r.role !== "standalone" ? " · " + r.role : "";
+      found ||= r.url === node;
+      opts.push(h("option", { value: r.url, selected: r.url === node }, `shard ${s.shard} · ${r.url}${role}${r.status === "down" ? " (down)" : ""}`));
+    }
+    if (!found) opts.push(h("option", { value: node, selected: true }, node));
+    const sel = h("select", { class: "select", "aria-label": "Server to profile", onchange: () => { location.hash = "#/profile?tab=" + tab + (sel.value ? "&node=" + encodeURIComponent(sel.value) : ""); } }, opts);
+    clear(el, h("span", { class: "small dim" }, "Profile"), sel,
+      h("span", { class: "small muted" }, node ? "This server takes the profile itself; the coordinator asks it over gRPC." : "The coordinator's own process: choose a shard's server to profile it."));
+    el.style.display = "";
+  }).catch(() => {});
+  return el;
+}
+
 function save(name, text, type) {
   const a = h("a", { href: URL.createObjectURL(new Blob([text], { type })), download: name });
   document.body.append(a); a.click();
@@ -179,7 +211,7 @@ function sampler(body, cfg) {
       h("div", { class: "meter", style: { width: "min(420px, 90%)" } }, bar), status) }));
     tick = setInterval(() => { const el = (performance.now() - t0) / 1000; bar.style.width = Math.min(100, el / seconds * 100) + "%"; status.textContent = el < seconds ? `${Math.ceil(seconds - el)} s left` : "Reading the frames' names…"; }, 200);
     try {
-      const p = await api(cfg.endpoint, { body: req });
+      const p = await api(cfg.endpoint + onNode(cfg.node), { body: req });
       if (gone) return;
       cfg.show(out, p, req);
     } catch (e) {
@@ -193,7 +225,7 @@ function sampler(body, cfg) {
 /** The head of a profile's answer: what it was of, downloads, the query. */
 function profileHead(p, req, what, downloads) {
   return [
-    h("div", { class: "row" }, h("span", { class: "small muted" }, `${req.sql ? "a query in a loop" : "the whole server"} · ${fmt.n(p.seconds)} s ${what} · ${new Date().toLocaleTimeString()}`), h("span", { class: "sep" }),
+    h("div", { class: "row" }, h("span", { class: "small muted" }, `${req.sql ? "a query in a loop" : "the whole server"}${p.node ? " on " + p.node : ""} · ${fmt.n(p.seconds)} s ${what} · ${new Date().toLocaleTimeString()}`), h("span", { class: "sep" }),
       downloads,
       req.sql ? h("a", { class: "btn sm", href: "#/profile?tab=query&sql=" + encodeURIComponent(req.sql), title: "Its steps, once" }, icon("flame"), "Profile its steps") : null),
     req.sql ? sqlBlock(req.sql) : null,
@@ -219,9 +251,9 @@ function hottest(p, value = (s) => s.samples) {
  * was running, as a flame graph and by function. Of the whole server
  * (whatever its clients send), or of one query run again and again.
  */
-function cpu(body) {
+function cpu(body, node) {
   return sampler(body, {
-    key: "cpu", button: "Take a CPU profile", endpoint: "/v1/profile/cpu",
+    key: "cpu", button: "Take a CPU profile", endpoint: "/v1/profile/cpu", node,
     rate: { label: "at", options: HZ, param: "hz", def: 99, title: "Samples a second of each thread's CPU time: more is finer, and slows the threads it interrupts more" },
     note: "One profile at a time. The stacks are sampled with SIGPROF; frames are named from the binary's symbols.",
     doing: (what, hz) => what === "query" ? `Running the query in a loop and sampling every thread at ${hz} Hz…` : `Sampling every thread at ${hz} Hz…`,
@@ -267,34 +299,45 @@ function showCpu(out, p, req) {
  * its resident memory, over time; an allocation profile (where the bytes
  * are allocated, and which are still held); and the threads.
  */
-function memory(body) {
+function memory(body, node) {
   const figures = h("div", { class: "grid g6 prof-kpis", style: { marginBottom: "14px" } });
   const brush = (a, b) => setZoom(a == null ? null : [a, b]);
-  const heapChart = timeChart({ height: 190, label: "memory", domain, onBrush: brush, fmt: (v) => fmt.bytes(v), series: [
+  // Another node's charts are drawn from its figures read every 2 s since
+  // the tab opened; this server's from its series.
+  const own = node ? { label: "memory" } : { label: "memory", domain, onBrush: brush };
+  const read = [];
+  const heapChart = timeChart({ height: 190, ...own, fmt: (v) => fmt.bytes(v), series: [
     { name: "heap in use", get: (p) => p.heap_bytes, area: true },
     { name: "resident", get: (p) => p.rss_bytes, color: SERIES[2] },
     { name: "heap peak", get: (p) => p.heap_peak_bytes, color: SERIES[6], dash: "4 3" },
   ] });
-  const rateChart = timeChart({ height: 190, label: "allocations", domain, onBrush: brush, fmt: (v) => fmt.bytes(v) + "/s", series: [
+  const rateChart = timeChart({ height: 190, ...own, label: "allocations", fmt: (v) => fmt.bytes(v) + "/s", series: [
     { name: "allocated a second", get: (p) => p.alloc_bytes_s, area: true, color: SERIES[1] },
   ] });
   const charts = h("div", { class: "grid g2", style: { marginBottom: "14px" } },
-    card({ title: "Memory", sub: "the heap in use, its peak and the resident memory", body: heapChart }),
-    card({ title: "Allocation rate", sub: "bytes allocated a second, every thread", body: rateChart }));
+    card({ title: "Memory", sub: node ? "the heap in use, its peak and the resident memory, since this page opened" : "the heap in use, its peak and the resident memory", body: heapChart }),
+    card({ title: "Allocation rate", sub: node ? "bytes allocated a second, every thread, since this page opened" : "bytes allocated a second, every thread", body: rateChart }));
   const prof = h("div", { style: { marginBottom: "14px" } });
   const threadsBox = h("div");
   body.append(figures, charts, prof, threadsBox);
-  const drawCharts = () => { const pts = visible(); heapChart.update(pts); rateChart.update(pts); };
+  const drawCharts = () => { const pts = node ? read : visible(); heapChart.update(pts); rateChart.update(pts); };
   drawCharts();
-  const offPoints = bus.on("points", drawCharts);
-  const offRange = bus.on("range", drawCharts);
-  let installed = true;
+  const offPoints = node ? null : bus.on("points", drawCharts);
+  const offRange = node ? null : bus.on("range", drawCharts);
   async function drawFigures() {
     try {
-      const m = await api("/v1/profile/memory");
+      const m = await api("/v1/profile/memory" + onNode(node));
       const hp = m.heap || {};
-      installed = hp.installed;
-      const pt = last();
+      let pt = last();
+      if (node) {
+        // The rates from two reads of the node's counts.
+        const b = read[read.length - 1], secs = b && m.at_ms > b.t ? (m.at_ms - b.t) / 1000 : null;
+        pt = { t: m.at_ms, heap_bytes: hp.in_use_bytes, heap_peak_bytes: hp.peak_bytes, rss_bytes: m.rss_bytes, allocated: hp.allocated_bytes, allocs: hp.allocs,
+          alloc_bytes_s: secs ? Math.max(0, (hp.allocated_bytes - b.allocated) / secs) : null, allocs_s: secs ? Math.max(0, (hp.allocs - b.allocs) / secs) : null };
+        read.push(pt);
+        if (read.length > 900) read.shift();
+        drawCharts();
+      }
       clear(figures,
         kpi("Heap in use", hp.installed ? fmt.bytes(hp.in_use_bytes) : "–", hp.installed ? `peak ${fmt.bytes(hp.peak_bytes)}` : "not counted in this binary", "Bytes allocated and not yet freed, counted at every allocation and free"),
         kpi("Allocating", pt?.alloc_bytes_s != null ? fmt.bytes(pt.alloc_bytes_s) + "/s" : "–", pt?.allocs_s != null ? `${fmt.si(pt.allocs_s)} allocations a second` : null, "Over the latest 2 s"),
@@ -306,7 +349,7 @@ function memory(body) {
   }
   const stopFigures = every(2000, drawFigures);
   const heapSampler = sampler(prof, {
-    key: "heap", button: "Take an allocation profile", endpoint: "/v1/profile/heap",
+    key: "heap", button: "Take an allocation profile", endpoint: "/v1/profile/heap", node,
     rate: { label: "a sample every", options: EVERY, param: "every", def: 2 << 20, title: "About one allocation is sampled in every this many bytes a thread allocates: smaller is finer and slows the server more (each sample walks a stack)" },
     note: "One profile at a time. Each sampled allocation keeps its stack; one freed before the end is marked so.",
     doing: (what, every) => what === "query" ? `Running the query in a loop and sampling an allocation every ${everyName(every)}…` : `Sampling an allocation every ${everyName(every)} each thread allocates…`,
@@ -331,7 +374,7 @@ function memory(body) {
   let lastList = null;
   async function readThreads() {
     try {
-      const j = await api("/v1/profile/threads");
+      const j = await api("/v1/profile/threads" + onNode(node));
       const before = prev ? new Map(prev.threads.map((t) => [t.tid, t])) : null;
       const secs = prev ? Math.max(0.001, (j.at_ms - prev.at_ms) / 1000) : null;
       lastList = j.threads.map((t) => {

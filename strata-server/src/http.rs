@@ -30,10 +30,10 @@
 //! | `GET /v1/queries/request/:id` | | `{queries}`: those a request (its `x-request-id`) ran |
 //! | `GET /v1/queries/finished/:id` | | one ended query with its whole profile: trace, steps ([`strata::query::steps`]) and plan lines (the lists give each without them, unless `full=true`) |
 //! | `GET /v1/profile/settings`, `PUT /v1/profile/settings` | `{slow_ms?, cpu_all?}` | the slow threshold (until restarted) and whether every query's CPU time is measured |
-//! | `POST /v1/profile/cpu?format=folded` | `{seconds?, hz?, sql?, params?, clients?}` | a CPU profile ([`crate::profiler`]) of the whole server for `seconds`, or of `sql` run again and again for that long by `clients` callers at once (1 to 64): every thread's stacks, sampled `hz` times a CPU second; `format=folded` answers folded lines (flamegraph.pl, speedscope); 409 while another is taken |
-//! | `GET /v1/profile/memory` | | the heap ([`crate::heap`]: bytes in use and their peak, bytes allocated, allocations and frees), the resident memory and its peak, and the threads |
-//! | `POST /v1/profile/heap?format=folded&value=in_use` | `{seconds?, every?, sql?, params?, clients?}` | an allocation profile ([`crate::heap::take`]): about one allocation in every `every` bytes (default 2 MiB) a thread allocates, sampled for `seconds`, with its stack; by stack, the bytes allocated and those still in use at the end; a query in a loop as for a CPU profile |
-//! | `GET /v1/profile/threads` | | each thread of the process: its name, state, CPU time and context switches (Linux) |
+//! | `POST /v1/profile/cpu?format=folded&node=` | `{seconds?, hz?, sql?, params?, clients?}` | a CPU profile ([`crate::profiler`]) of the whole server for `seconds`, or of `sql` run again and again for that long by `clients` callers at once (1 to 64): every thread's stacks, sampled `hz` times a CPU second; `format=folded` answers folded lines (flamegraph.pl, speedscope); 409 while another is taken |
+//! | `GET /v1/profile/memory?node=` | | the heap ([`crate::heap`]: bytes in use and their peak, bytes allocated, allocations and frees), the resident memory and its peak, and the threads |
+//! | `POST /v1/profile/heap?format=folded&value=in_use&node=` | `{seconds?, every?, sql?, params?, clients?}` | an allocation profile ([`crate::heap::take`]): about one allocation in every `every` bytes (default 2 MiB) a thread allocates, sampled for `seconds`, with its stack; by stack, the bytes allocated and those still in use at the end; a query in a loop as for a CPU profile |
+//! | `GET /v1/profile/threads?node=` | | each thread of the process: its name, state, CPU time and context switches (Linux); on a coordinator, each of these four with `node` (a replica URL of `/v1/cluster`) is that server's, asked over gRPC (`Profile`) |
 //! | `GET /v1/queries/stats?limit=n`, `POST /v1/queries/stats/reset` | | statistics per statement shape, by time spent ([`crate::telemetry::Statements`]) |
 //! | `GET /v1/timeseries?since=ms` | | `{interval_ms, points}`: rates and gauges every few seconds, the last hour ([`crate::telemetry::Series`]) |
 //! | `GET /v1/logs?after=seq&level=warn&request=id&q=text&limit=n` | | `{lines, last, filter}`: the latest log lines ([`crate::obs::ring`]) |
@@ -75,7 +75,7 @@ use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
 use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
 use crate::keys::{self, Principal, Scope};
-use crate::{agent, heap, json as js, obs, profiler, telemetry, ui, ApiError};
+use crate::{agent, json as js, obs, profiling, telemetry, ui, ApiError};
 
 
 /// Why a request failed on the server's side, for [`observe`] to log.
@@ -1145,140 +1145,44 @@ async fn put_profile_settings(State(app): State<App>, AxJson(b): AxJson<Json>) -
     Ok(audited(profile_settings_json(&app), format!("profiling: {}", did.join(", "))))
 }
 
-/// What a profile runs while it is taken: nothing (the whole server, as
-/// its clients use it), or a query run again and again by `clients`
-/// callers at once until the profile ends or a run fails, its run times
-/// kept.
-struct Load {
-    during: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-    runs: Option<(usize, std::sync::Arc<std::sync::Mutex<(Vec<f64>, Option<ApiError>)>>)>,
-}
-
-impl Load {
-    async fn of(app: &App, b: &Json) -> Result<Load, ApiError> {
-        let Some(_) = b.get("sql").filter(|s| !s.is_null()) else { return Ok(Load { during: Box::pin(std::future::pending()), runs: None }) };
-        let clients = match b.get("clients") {
-            None | Some(Json::Null) => 1,
-            Some(v) => v.as_u64().filter(|c| (1..=64).contains(c)).ok_or_else(|| ApiError::bad("clients is a whole number from 1 to 64"))? as usize,
-        };
-        let req = QueryReq { sql: body_str(b, "sql")?.to_string(), params: app.svc.params(b.get("params")).await?, quiet: true, ..Default::default() };
-        // Once first: a query that fails answers at once, and the caches it
-        // reads are warm when the profile starts.
-        app.svc.query(req.clone()).await?;
-        let runs: std::sync::Arc<std::sync::Mutex<(Vec<f64>, Option<ApiError>)>> = Default::default();
-        let (svc, kept) = (app.svc.clone(), runs.clone());
-        let during = async move {
-            futures::future::join_all((0..clients).map(|_| async {
-                loop {
-                    let t = Instant::now();
-                    let r = svc.query(req.clone()).await;
-                    let mut k = kept.lock().unwrap_or_else(|e| e.into_inner());
-                    if k.1.is_some() {
-                        return;
-                    }
-                    match r {
-                        Ok(_) => k.0.push(t.elapsed().as_secs_f64() * 1e3),
-                        Err(e) => {
-                            k.1 = Some(e);
-                            return;
-                        }
-                    }
-                }
-            }))
-            .await;
-        };
-        Ok(Load { during: Box::pin(during), runs: Some((clients, runs)) })
-    }
-
-    /// The runs' times, for the answer.
-    fn runs(&self) -> Option<Json> {
-        let (clients, runs) = self.runs.as_ref()?;
-        let (mut ms, error) = std::mem::take(&mut *runs.lock().unwrap_or_else(|e| e.into_inner()));
-        ms.sort_by(f64::total_cmp);
-        let at = |f: f64| ms.get(((ms.len() as f64 - 1.0) * f).round() as usize).copied();
-        Some(json!({"count": ms.len(), "clients": clients, "min_ms": at(0.0), "median_ms": at(0.5), "p99_ms": at(0.99), "max_ms": at(1.0), "error": error.map(|e| e.message)}))
-    }
-}
-
-fn seconds_of(b: &Json, max: f64) -> Result<f64, ApiError> {
-    match b.get("seconds") {
-        None | Some(Json::Null) => Ok(5.0),
-        Some(v) => v.as_f64().filter(|s| *s > 0.0 && *s <= max).ok_or_else(|| ApiError::bad(format!("seconds is a number above 0 and at most {max}"))),
-    }
-}
-
-fn refused(e: profiler::Refused) -> ApiError {
-    match e {
-        profiler::Refused::Busy => ApiError { status: 409, message: "a profile of this kind is being taken: one at a time".into() },
-        profiler::Refused::Unavailable(m) => ApiError { status: 501, message: format!("no profile: {m}") },
-    }
-}
-
-/// A CPU profile ([`profiler`]): of the whole server for `seconds`
-/// (default 5), or of `sql` run again and again ([`Load`]). It answers the
-/// profile with how busy the server was (`cores`), the samples delivered
-/// a CPU second (`rate`) and, for a query, its runs and their times; with
-/// `?format=folded`, folded lines to download.
-async fn cpu_profile(State(app): State<App>, Query(q): Params, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
-    let seconds = seconds_of(&b, profiler::MAX_SECONDS)?;
-    let hz = match b.get("hz") {
-        None | Some(Json::Null) => 99,
-        Some(v) => v.as_i64().filter(|h| (1..=profiler::MAX_HZ as i64).contains(h)).ok_or_else(|| ApiError::bad(format!("hz is a whole number from 1 to {}", profiler::MAX_HZ)))? as i32,
+/// A profile ([`profiling`]) of this server, or with `?node=` on a
+/// coordinator, of that server of its cluster (one of `GET /v1/cluster`'s
+/// replica URLs, over gRPC: [`crate::coord::Coordinator::profile`]).
+/// `?format=folded` (`&value=in_use`) answers folded lines to download.
+async fn profile(app: &App, kind: profiling::Kind, q: &std::collections::HashMap<String, String>, body: Json) -> Result<Response, ApiError> {
+    let asked = profiling::Asked { kind, body, folded: q.get("format").map(String::as_str) == Some("folded"), in_use: q.get("value").map(String::as_str) == Some("in_use") };
+    let answer = match q.get("node").map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        Some(node) => app.svc.profile_node(node, asked).await?,
+        None => profiling::take(&app.svc, asked).await?,
     };
-    let mut load = Load::of(&app, &b).await?;
-    let (p, _) = profiler::take(hz, seconds, &mut load.during).await.map_err(refused)?;
-    tracing::info!(seconds = p.seconds, hz, samples = p.samples, query = load.runs.is_some(), "CPU profile taken");
-    if q.get("format").map(String::as_str) == Some("folded") {
-        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=\"strata-cpu.folded\"")], p.folded()).into_response());
-    }
-    let mut j = json!(p);
-    j["cores"] = json!(p.cores());
-    j["rate"] = json!(p.rate());
-    if let Some(r) = load.runs() {
-        j["runs"] = r;
-    }
-    Ok(AxJson(j).into_response())
+    Ok(match answer {
+        profiling::Answer::Json(j) => AxJson(j).into_response(),
+        profiling::Answer::Folded(file, text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\""))], text).into_response(),
+    })
+}
+
+/// A CPU profile ([`crate::profiler`]): of the whole server for `seconds`
+/// (default 5), or of `sql` run again and again by `clients` callers. It
+/// answers the profile with how busy the server was (`cores`), the samples
+/// delivered a CPU second (`rate`) and, for a query, its runs and their
+/// times.
+async fn cpu_profile(State(app): State<App>, Query(q): Params, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    profile(&app, profiling::Kind::Cpu, &q, b).await
 }
 
 /// The heap's counts, the process's resident memory, and its threads.
-async fn memory(State(app): State<App>) -> AxJson<Json> {
-    let (rss, _) = telemetry::process_usage();
-    let threads = profiler::threads();
-    AxJson(json!({
-        "heap": heap::stats(),
-        "rss_bytes": rss,
-        "peak_rss_bytes": telemetry::peak_rss(),
-        "memory_limit_bytes": strata::storage::memory_limit(),
-        "query_memory_bytes": app.svc.query_memory.as_ref().map(|b| b.used()),
-        "threads": threads.len(),
-    }))
+async fn memory(State(app): State<App>, Query(q): Params) -> Result<Response, ApiError> {
+    profile(&app, profiling::Kind::Memory, &q, Json::Null).await
 }
 
-/// An allocation profile ([`heap::take`]), of the whole server or of a
-/// query in a loop as [`cpu_profile`]; `?format=folded` answers the bytes
-/// allocated by stack, or with `&value=in_use` those still in use.
+/// An allocation profile ([`crate::heap::take`]), of the whole server or of a
+/// query in a loop as [`cpu_profile`].
 async fn heap_profile(State(app): State<App>, Query(q): Params, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
-    let seconds = seconds_of(&b, heap::MAX_SECONDS)?;
-    let every = match b.get("every") {
-        None | Some(Json::Null) => heap::EVERY_DEFAULT,
-        Some(v) => v.as_u64().filter(|e| (heap::MIN_EVERY..=heap::MAX_EVERY).contains(e)).ok_or_else(|| ApiError::bad(format!("every is a number of bytes from {} to {}", heap::MIN_EVERY, heap::MAX_EVERY)))?,
-    };
-    let mut load = Load::of(&app, &b).await?;
-    let (p, _) = heap::take(every, seconds, &mut load.during).await.map_err(refused)?;
-    tracing::info!(seconds = p.seconds, every, samples = p.samples, query = load.runs.is_some(), "allocation profile taken");
-    if q.get("format").map(String::as_str) == Some("folded") {
-        let in_use = q.get("value").map(String::as_str) == Some("in_use");
-        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=\"strata-heap.folded\"")], p.folded(in_use)).into_response());
-    }
-    let mut j = json!(p);
-    if let Some(r) = load.runs() {
-        j["runs"] = r;
-    }
-    Ok(AxJson(j).into_response())
+    profile(&app, profiling::Kind::Heap, &q, b).await
 }
 
-async fn threads() -> AxJson<Json> {
-    AxJson(json!({"threads": profiler::threads(), "at_ms": telemetry::now_ms()}))
+async fn threads(State(app): State<App>, Query(q): Params) -> Result<Response, ApiError> {
+    profile(&app, profiling::Kind::Threads, &q, Json::Null).await
 }
 
 async fn request_queries(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> AxJson<Json> {

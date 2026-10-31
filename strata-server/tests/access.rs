@@ -151,6 +151,14 @@ async fn keys_have_scopes_and_the_audit_log_keeps_what_they_did() {
     let mut rd = client(read2).await;
     assert_eq!(rd.write(pb::WriteRequest::default()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     assert!(rd.health(pb::Empty {}).await.is_ok());
+    // A profile, as over HTTP, needs an admin key (or the token).
+    let threads = || pb::ProfileRequest { kind: "threads".into(), ..Default::default() };
+    assert_eq!(rd.profile(threads()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    assert_eq!(wr.profile(threads()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    let j: Json = serde_json::from_slice(&ops.profile(threads()).await.unwrap().into_inner().body).unwrap();
+    assert!(j["threads"].is_array(), "{j}");
+    assert!(rootc.profile(pb::ProfileRequest { kind: "memory".into(), ..Default::default() }).await.is_ok());
+    assert_eq!(ops.profile(pb::ProfileRequest { kind: "disk".into(), ..Default::default() }).await.unwrap_err().code(), tonic::Code::InvalidArgument);
     let mut nobody = client("sk_00000000_ff".into()).await;
     assert_eq!(nobody.health(pb::Empty {}).await.unwrap_err().code(), tonic::Code::Unauthenticated);
 }

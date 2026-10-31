@@ -93,6 +93,30 @@ service Strata {
   // compares with its own at the same transaction. Answered once a
   // version.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
+  // A profile of this server, as its HTTP routes /v1/profile/<kind> take
+  // one: a coordinator asks it for one of its shards' servers
+  // (/v1/profile/...?node=). It needs an admin key or the cluster's token.
+  // A server older than the call answers Unimplemented; no protocol
+  // version is needed.
+  rpc Profile(ProfileRequest) returns (ProfileResponse);
+}
+
+message ProfileRequest {
+  // "cpu", "heap" (allocations), "memory" or "threads".
+  string kind = 1;
+  // The HTTP route's body, as JSON: {seconds, hz, every, sql, params,
+  // clients}; empty for none.
+  bytes body_json = 2;
+  // Answer folded lines (thread;root;...;leaf value) instead of JSON.
+  bool folded = 3;
+  // With folded, of an allocation profile: the bytes still in use at its
+  // end instead of those allocated.
+  bool in_use = 4;
+}
+
+message ProfileResponse {
+  // The answer of the HTTP route: JSON, or with folded the lines.
+  bytes body = 1;
 }
 
 message RestoreChunk {
@@ -274,6 +298,12 @@ message QueryRequest {
   // To a coordinator: the numbers its write answered, one per shard
   // (WriteResponse.seq_nos), instead of min_seq_no.
   repeated uint64 min_seq_nos = 14;
+  // Measure the CPU time (and, with the server's counting allocator, the
+  // allocations) of each step of the query's profile
+  // (strata::query::steps), which costs a system call per step. A
+  // coordinator sends it to its shards with the query that asked it. A
+  // server that does not know the field answers the steps without them.
+  bool profile = 15;
 }
 
 // A plan (strata::query::ir): a statement as a tree of operators over typed
@@ -866,7 +896,8 @@ message QueryResponse {
   repeated double scores = 4;
   // FusionParts (JSON) in shard mode.
   bytes parts_json = 5;
-  // ExecStats (JSON): plan lines and counters.
+  // ExecStats (JSON): plan lines, counters, and the query's timed steps
+  // (strata::query::steps), their times from the request's start.
   bytes stats_json = 6;
   double took_ms = 7;
   // With hold: the lease on the snapshot the query read.

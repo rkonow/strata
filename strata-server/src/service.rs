@@ -2295,6 +2295,16 @@ impl Service {
         })
     }
 
+    /// A profile of `node`, a server of this coordinator's cluster
+    /// ([`Coordinator::profile`]); a server that is not a coordinator has
+    /// no other node to profile.
+    pub async fn profile_node(&self, node: &str, a: crate::profiling::Asked) -> Result<crate::profiling::Answer, ApiError> {
+        match &self.backend {
+            Backend::Local(_) => Err(ApiError::bad("node names a server of a coordinator's cluster: this server is not a coordinator, so leave node out to profile it")),
+            Backend::Cluster(c) => c.profile(node, a).await,
+        }
+    }
+
     /// Where this server is in its cluster, and how each copy is doing
     /// (`GET /v1/cluster`): a server's own health and latest point; a
     /// coordinator asks every replica of every shard

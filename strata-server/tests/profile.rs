@@ -172,10 +172,9 @@ async fn a_coordinator_s_profile_holds_each_shard_s_steps() {
     for s in 0..2 {
         let db = open(dir.path(), &format!("s{s}.strata"), shard(s));
         let schema = db.schema().clone();
-        // The shards measure their steps' CPU time (every query's).
-        let svc = service(Backend::Local(db), schema);
-        svc.profiling.cpu_all.store(true, std::sync::atomic::Ordering::Relaxed);
-        shards.push(grpc(svc).await);
+        // The shards measure their steps' CPU time when the coordinator's
+        // query asks (QueryRequest.profile), not for every query.
+        shards.push(grpc(service(Backend::Local(db), schema)).await);
     }
     let c = Coordinator::connect(shards.clone()).await.unwrap();
     let schema = c.schema.clone();
@@ -196,7 +195,7 @@ async fn a_coordinator_s_profile_holds_each_shard_s_steps() {
         let own = &st[inner[0]];
         assert_eq!(own["op"], "on the shard");
         // The shard's time lies inside its call, and its steps inside it,
-        // their CPU time measured as the shard was set to.
+        // their CPU time measured as the query asked.
         let (c0, c1) = (s["start_us"].as_f64().unwrap(), s["start_us"].as_f64().unwrap() + s["us"].as_f64().unwrap());
         let (o0, o1) = (own["start_us"].as_f64().unwrap(), own["start_us"].as_f64().unwrap() + own["us"].as_f64().unwrap());
         assert!(o0 + 1.0 >= c0 && o1 <= c1 + 1.0, "{own} outside {s}");
@@ -209,4 +208,9 @@ async fn a_coordinator_s_profile_holds_each_shard_s_steps() {
     // Its CPU time is its shards'.
     let (_, recent) = get(&base, "/v1/queries/recent").await;
     assert!(recent["queries"][0]["cpu_ms"].as_f64().unwrap() > 0.0, "{recent}");
+    // Without "profile", the shards measure no CPU time.
+    let j = query(&base, json!({"sql": BM25})).await;
+    let st = steps(&j["stats"]["steps"]);
+    assert!(st.iter().any(|s| s["op"] == "rank"), "{j}");
+    assert!(st.iter().all(|s| s.get("cpu_us").is_none_or(|c| c.is_null())), "{j}");
 }
