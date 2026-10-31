@@ -734,8 +734,14 @@ async fn a_coordinator_writes_to_each_shards_primary() {
     let roles: Vec<Json> = (0..2).map(|i| h["shards"][i]["replicas"].as_array().unwrap().iter().map(|r| r["role"].clone()).collect()).collect();
     assert_eq!(roles, [json!(["primary", "replica"]), json!(["replica", "primary"])], "{h}");
 
-    // A shard with replicas and no primary answering takes no writes.
-    let lone = shards.iter().enumerate().map(|(i, s)| s.split('|').nth(if i == 0 { 1 } else { 0 }).unwrap().to_string()).collect();
+    // A shard with replicas and no primary answering takes no writes. (A
+    // coordinator given only the replicas above would route by the cluster
+    // map they hold, which names the primaries.)
+    let mut lone = Vec::new();
+    for s in 0..2 {
+        let db = create_with(dir.path(), &format!("lone{s}.strata"), 1 << 20, |i| shard_of(&key(i), 2) == s);
+        lone.push(replica(db, None).await.1);
+    }
     let c = Coordinator::connect(lone).await.unwrap();
     let e = c.write_ops(vec![set("p0000003", "sold", json!(1))], None).await.unwrap_err();
     assert!(e.status == 503 && e.message.contains("has no primary answering"), "{}", e.message);
@@ -1404,7 +1410,7 @@ async fn a_replica_is_promoted_and_the_old_primary_follows_it() {
     assert_eq!(rows(&pdb), rows(&r1db), "the transaction no copy got is dropped");
     let n = pdb.storage().numbering().unwrap();
     assert_eq!((n.term, n.seq, n.term_at(6)), (2, 6, 2));
-    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": old_id, "follows": {"primary": new_id, "term": 2}}));
+    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": old_id, "follows": {"primary": new_id, "term": 2}, "role": "replica"}));
     // And follows it from there.
     let w = r1.write_ops(vec![set("p0000004", "sold", json!(8))], None).await.unwrap();
     until("the old primary applies the new one's writes", || async { last(&pdb) == w.seq_no.unwrap() }).await;
@@ -1465,15 +1471,16 @@ async fn a_replaced_primary_is_fenced_and_starts_again_only_when_promoted() {
     assert!(e.contains("a primary of term 3 replaced this one: start it with --replica"), "{e}");
     let p = Primary::start(pdb.clone(), Some(&file("p.strata")), PrimaryOptions { promote: true, ..Default::default() }).unwrap();
     assert_eq!(pdb.storage().numbering().unwrap().term, 4);
-    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id}));
+    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "role": "primary", "replicas": [], "write_acks": "all"}));
     // Replaced again, and started as a replica: it no longer counts as
     // replaced once it follows.
     assert_eq!(p.shipped_to("q", 5).unwrap_err().status, 409);
-    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "replaced_by": 5}));
+    // It keeps the part it has to take up: a replica of the new primary.
+    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "replaced_by": 5, "role": "replica"}));
     drop(p);
     let f = Follow::open(pdb.clone(), Some(&file("p.strata"))).unwrap();
     assert!(f.replicate(pb::ReplicateRequest { term: 5, prev_term: 1, prev_seq: 2, primary: "q".into(), ..Default::default() }).await.unwrap().matched);
-    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "follows": {"primary": "q", "term": 5}}));
+    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "follows": {"primary": "q", "term": 5}, "role": "replica"}));
 
     // So does a database that followed a primary as a replica.
     // Its primary's term is 3, though no transaction of that term reached

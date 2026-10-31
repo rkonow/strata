@@ -19,7 +19,11 @@
 // next codes of semantic-ID prefixes (`SidNext`), which a coordinator asks
 // only of shards of 7 or newer; 8 counts the rows of a guard's levels
 // (`GuardCounts`), which a coordinator of a guarded query needs of every
-// shard. A caller asks a server's versions with
+// shard; 9 keeps the cluster map: the slot map a shard holds names every
+// shard's servers, a `Slots` call without a map asks a shard for the map
+// it holds, from which a coordinator learns the cluster's servers, and
+// `Configure` sets a server's part in replication while it serves. A
+// caller asks a server's versions with
 // `Hello` (a server that answers Unimplemented speaks 1) and speaks the
 // newest both know; a coordinator speaks the oldest of those among its
 // shards' replicas.
@@ -79,6 +83,11 @@ service Strata {
   // map of the same epoch, or while rows here have keys in other shards'
   // slots under the map.
   rpc Slots(SlotsRequest) returns (SlotsResponse);
+  // Protocol 9: sets this server's part in replication while it serves,
+  // and keeps it beside its database: the primary of its shard, shipping
+  // to `replicas`; a replica, applying what a primary ships; or
+  // standalone. Answers its part now.
+  rpc Configure(ConfigureRequest) returns (ConfigureResponse);
   // Replication: a primary (--replicas) ships its numbered transactions to
   // a replica (--replica), which applies them in order under the
   // primary's term and numbers.
@@ -162,8 +171,10 @@ message ReplicateResponse {
 }
 
 message SlotsRequest {
-  // The map as JSON: {"epoch": 1, "shards": [[[0, 2048]], [[2048, 4096]]]},
-  // each shard's slots as [start, end) ranges of the 4,096.
+  // The map as JSON: {"epoch": 1, "shards": [[[0, 2048]], [[2048, 4096]]],
+  // "replicas": [["http://a0:7701"], ["http://b0:7701"]]}, each shard's
+  // slots as [start, end) ranges of the 4,096 and, from protocol 9, each
+  // shard's servers. Empty (protocol 9): only ask the map the shard holds.
   bytes map_json = 1;
   // This server's shard in the map.
   uint32 shard = 2;
@@ -172,6 +183,35 @@ message SlotsRequest {
 message SlotsResponse {
   // The epoch the shard holds.
   uint64 epoch = 1;
+  // Protocol 9: the map it holds, as JSON (empty without one), and its
+  // shard in it.
+  bytes map_json = 2;
+  uint32 shard = 3;
+}
+
+message ConfigureRequest {
+  // The part to take. PRIMARY on a primary ships to `replicas` from now
+  // on; on a standalone server (which must number its writes), it starts
+  // shipping. REPLICA on a standalone server makes it wait for a primary,
+  // whose copy replaces its rows (refused while it holds rows, unless
+  // `force`); on a primary, only once another replaced it, or with
+  // `force`. STANDALONE ends replication: a primary stops shipping, and a
+  // replica (with `force`) takes writes of its own.
+  Role role = 1;
+  // PRIMARY: the copies to ship to, as gRPC URLs.
+  repeated string replicas = 2;
+  // PRIMARY: all, majority or primary ("": as now, or all).
+  string write_acks = 3;
+  bool force = 4;
+}
+
+message ConfigureResponse {
+  Role role = 1;
+  uint64 term = 2;
+  uint64 seq_no = 3;
+  // A primary's replicas and acks.
+  repeated string replicas = 4;
+  string write_acks = 5;
 }
 
 message ReleaseRequest {

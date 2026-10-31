@@ -108,7 +108,13 @@ async fn shards_rank_by_a_model_like_one_database() {
     let other = service(dir.path(), "other.strata", &xgb, |i| shard_of(&key(i), 3) == 0);
     let e = other.run_plan((*opened).clone(), After::Any, 0).await.err().unwrap().message;
     assert!(e.contains("ranking model m here is not the one the plan was made with"), "{e}");
-    let mixed = coordinator(&[grpc(other.clone()).await, urls[1].clone(), urls[2].clone()], &lgb).await;
+    // Over servers of their own: the shards above hold a cluster map that
+    // names their servers.
+    let mut mixed_urls = vec![grpc(other.clone()).await];
+    for s in 1..3 {
+        mixed_urls.push(grpc(service(dir.path(), &format!("mixed{s}.strata"), &lgb, |i| shard_of(&key(i), 3) == s)).await);
+    }
+    let mixed = coordinator(&mixed_urls, &lgb).await;
     let e = query(&mixed, &queries[0]).await.err().unwrap();
     assert!(e.contains("ranking model m here is not the one the plan was made with"), "{e}");
     // A coordinator without the model cannot score the shards' rows.

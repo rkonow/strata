@@ -225,6 +225,11 @@ pub struct PrimaryOptions {
     /// knows (`--promote`): needed when it was a replica, or another
     /// primary replaced it.
     pub promote: bool,
+    /// Its replicas join it now (`Configure`): each starts out of sync
+    /// and is sent a copy of the primary before what follows, as it may
+    /// lack rows that took no number (a bulk load). A replica added later
+    /// ([`Primary::reconfigure`]) joins so too.
+    pub joining: bool,
 }
 
 impl Default for PrimaryOptions {
@@ -242,6 +247,7 @@ impl Default for PrimaryOptions {
             copy_retry: Duration::from_secs(30),
             verify_every: Duration::from_secs(600),
             promote: false,
+            joining: false,
         }
     }
 }
@@ -253,6 +259,16 @@ pub fn file_of(db: &Path) -> PathBuf {
     p.into()
 }
 
+/// A server's part in replication, as kept beside its database, so that
+/// it starts again in it without flags saying so ([`kept_role`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeptRole {
+    /// The primary of its shard, shipping to these replicas.
+    Primary { replicas: Vec<String>, acks: Acks },
+    /// A replica, applying what its primary ships.
+    Replica,
+}
+
 /// What `<db>.replication` holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Kept {
@@ -261,6 +277,22 @@ struct Kept {
     follows: Option<(String, u64)>,
     /// The newer term of a primary that replaced this one, as a primary.
     replaced_by: Option<u64>,
+    /// Its part, as last set (`None`: standalone, or kept by a version
+    /// from before roles were kept, whose flags say).
+    role: Option<KeptRole>,
+}
+
+/// The part in replication kept beside the database at `db`
+/// ([`KeptRole`]), and whether a primary of a newer term replaced it as a
+/// primary: a server started without `--replicas`, `--replica` or
+/// `--promote` takes it up again.
+pub fn kept_role(db: &Path) -> Result<(Option<KeptRole>, bool), String> {
+    let path = file_of(db);
+    if !path.exists() {
+        return Ok((None, false));
+    }
+    let k = Kept::open(Some(&path))?;
+    Ok((k.role, k.replaced_by.is_some()))
 }
 
 impl Kept {
@@ -278,7 +310,17 @@ impl Kept {
                 Json::Null => None,
                 t => Some(t.as_u64().ok_or_else(|| format!("{}: replaced_by is not a term", path.display()))?),
             };
-            return Ok(Kept { id, follows, replaced_by });
+            let role = match j["role"].as_str() {
+                None => None,
+                Some("replica") => Some(KeptRole::Replica),
+                Some("primary") => {
+                    let replicas = j["replicas"].as_array().map(|a| a.iter().filter_map(|u| u.as_str().map(String::from)).collect()).unwrap_or_default();
+                    let acks = j["write_acks"].as_str().and_then(Acks::parse).unwrap_or_default();
+                    Some(KeptRole::Primary { replicas, acks })
+                }
+                Some(r) => return Err(format!("{}: role {r:?} is primary or replica", path.display())),
+            };
+            return Ok(Kept { id, follows, replaced_by, role });
         }
         let k = Kept { id: new_id(), ..Kept::default() };
         k.save(Some(path)).map_err(|e| format!("keep the replication id in {}: {e}", path.display()))?;
@@ -299,8 +341,25 @@ impl Kept {
         if let Some(t) = self.replaced_by {
             j["replaced_by"] = json!(t);
         }
+        match &self.role {
+            None => {}
+            Some(KeptRole::Replica) => j["role"] = json!("replica"),
+            Some(KeptRole::Primary { replicas, acks }) => {
+                j["role"] = json!("primary");
+                j["replicas"] = json!(replicas);
+                j["write_acks"] = json!(acks.name());
+            }
+        }
         crate::service::save_json(path, &j)
     }
+}
+
+/// Forgets the part in replication kept at `file`: the server starts
+/// again standalone.
+pub fn forget_role(file: Option<&Path>) -> Result<(), String> {
+    let mut k = Kept::open(file)?;
+    k.role = None;
+    k.save(file).map_err(|e| e.to_string())
 }
 
 /// 32 hex digits, drawn at random.
@@ -390,6 +449,47 @@ struct Follower {
     verify_failures: AtomicU64,
     /// Wakes its shipper: a round ended, or one was asked for.
     wake: Arc<tokio::sync::Notify>,
+    /// The [`Primary::gen`] whose shipper ships to it: a primary given
+    /// other replicas ([`Primary::reconfigure`]) takes over the replicas
+    /// it keeps, and the shipper before stops.
+    owner: AtomicU64,
+}
+
+/// Numbers each [`Primary`] made by this process.
+static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl Follower {
+    fn new(url: &str, opts: &PrimaryOptions) -> Result<Follower, String> {
+        Ok(Follower {
+            url: url.to_string(),
+            client: coord::client(url, opts.token.as_ref(), opts.ca.as_deref()).map_err(|e| e.message)?,
+            acked: AtomicU64::new(0),
+            in_sync: AtomicBool::new(true),
+            error: Mutex::new(None),
+            shipped: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            copying: AtomicBool::new(false),
+            copies: AtomicU64::new(0),
+            verified: Mutex::new(Verified::default()),
+            verifying: AtomicBool::new(false),
+            diverged: AtomicBool::new(false),
+            verifications: AtomicU64::new(0),
+            divergences: AtomicU64::new(0),
+            verify_failures: AtomicU64::new(0),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            owner: AtomicU64::new(0),
+        })
+    }
+
+    /// A replica that joins a serving primary: out of sync, so that writes
+    /// do not wait for it, until it has installed a copy of the primary
+    /// and caught up from there.
+    fn joining(self) -> Follower {
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some("it joined: it is sent a copy of the primary first".into());
+        self.in_sync.store(false, Ordering::Relaxed);
+        self.diverged.store(true, Ordering::Relaxed);
+        self
+    }
 }
 
 /// What the last round comparing a replica's rows with its primary's found.
@@ -463,7 +563,9 @@ pub struct Primary {
     file: Option<PathBuf>,
     id: String,
     opts: PrimaryOptions,
-    followers: Vec<Follower>,
+    followers: Vec<Arc<Follower>>,
+    /// This primary among those the process made ([`GENERATION`]).
+    gen: u64,
     /// The last number committed, as the database's commit hook says.
     committed: Arc<watch::Sender<u64>>,
     /// Changed whenever a replica acknowledges or drops out.
@@ -491,7 +593,6 @@ impl Primary {
             let term = kept.newest(numbering.term) + 1;
             db.storage().begin_term(term).map_err(|e| format!("begin term {term}: {e}"))?;
             kept = Kept { id: kept.id, ..Kept::default() };
-            kept.save(file).map_err(|e| format!("keep the replication id: {e}"))?;
             tracing::info!(term, "promoted: the primary of a new term");
         } else if let Some((primary, term)) = &kept.follows {
             return Err(format!("this database is a replica of primary {primary} in term {term}: start it with --replica, or make it the primary of a new term with --promote"));
@@ -503,34 +604,27 @@ impl Primary {
 
     /// Starts shipping as [`Primary::start`] does, under id `kept.id`.
     fn run(db: Arc<Db>, file: Option<&Path>, kept: Kept, opts: PrimaryOptions) -> Result<Arc<Primary>, String> {
+        let joining = opts.joining;
+        let followers = opts.replicas.iter().map(|url| Follower::new(url, &opts).map(|f| Arc::new(if joining { f.joining() } else { f }))).collect::<Result<Vec<_>, String>>()?;
+        Primary::run_with(db, file, kept, opts, followers)
+    }
+
+    /// [`Primary::run`] shipping to `followers` (those of
+    /// `opts.replicas`), keeping its part beside the database.
+    fn run_with(db: Arc<Db>, file: Option<&Path>, mut kept: Kept, opts: PrimaryOptions, followers: Vec<Arc<Follower>>) -> Result<Arc<Primary>, String> {
         let numbering = db.storage().numbering().ok_or("a primary numbers its writes: start it with --seq-no")?;
         if !db.storage().keeps_ship_log() {
             return Err("a primary keeps a log of its transactions to ship (DbOptions::ship_log_bytes)".into());
         }
-        let followers = opts
-            .replicas
-            .iter()
-            .map(|url| {
-                Ok(Follower {
-                    url: url.clone(),
-                    client: coord::client(url, opts.token.as_ref(), opts.ca.as_deref()).map_err(|e| e.message)?,
-                    acked: AtomicU64::new(0),
-                    in_sync: AtomicBool::new(true),
-                    error: Mutex::new(None),
-                    shipped: AtomicU64::new(0),
-                    failures: AtomicU64::new(0),
-                    copying: AtomicBool::new(false),
-                    copies: AtomicU64::new(0),
-                    verified: Mutex::new(Verified::default()),
-                    verifying: AtomicBool::new(false),
-                    diverged: AtomicBool::new(false),
-                    verifications: AtomicU64::new(0),
-                    divergences: AtomicU64::new(0),
-                    verify_failures: AtomicU64::new(0),
-                    wake: Arc::new(tokio::sync::Notify::new()),
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let role = Some(KeptRole::Primary { replicas: opts.replicas.clone(), acks: opts.acks });
+        if kept.role != role || file.is_some_and(|f| !f.exists()) {
+            kept.role = role;
+            kept.save(file).map_err(|e| format!("keep the replication id and role: {e}"))?;
+        }
+        let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
+        for f in &followers {
+            f.owner.store(gen, Ordering::Relaxed);
+        }
         let committed = Arc::new(watch::channel(numbering.seq).0);
         let hook = committed.clone();
         db.storage().on_commit(move |n| {
@@ -542,6 +636,7 @@ impl Primary {
             id: kept.id,
             opts,
             followers,
+            gen,
             committed,
             progress: watch::channel(0).0,
             fenced: AtomicU64::new(0),
@@ -555,6 +650,40 @@ impl Primary {
 
     pub fn acks(&self) -> Acks {
         self.opts.acks
+    }
+
+    /// The replicas it ships to.
+    pub fn replicas(&self) -> &[String] {
+        &self.opts.replicas
+    }
+
+    /// A primary of the same database, id and term shipping to `replicas`
+    /// under `acks` from now on, in place of this one, which stops
+    /// shipping: replicas it ships to already keep what this one knows of
+    /// them, and new ones are asked their last transaction (an empty one
+    /// is sent a copy). Refused once another primary replaced this one.
+    pub fn reconfigure(&self, replicas: Vec<String>, acks: Acks) -> Result<Arc<Primary>, ApiError> {
+        if let t @ 1.. = self.replaced_by() {
+            return Err(conflict(format!("a primary of term {t} replaced this one, which ships to no replica: make it a replica of the new primary")));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = replicas.iter().find(|u| !seen.insert(u.as_str())) {
+            return Err(ApiError::bad(format!("{dup} is named twice")));
+        }
+        let opts = PrimaryOptions { replicas, acks, promote: false, ..self.opts.clone() };
+        let followers = opts
+            .replicas
+            .iter()
+            .map(|url| match self.followers.iter().find(|f| f.url == *url) {
+                Some(f) => Ok(f.clone()),
+                None => Follower::new(url, &opts).map(|f| Arc::new(f.joining())),
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(ApiError::bad)?;
+        let kept = Kept { id: self.id.clone(), ..Kept::default() };
+        let p = Primary::run_with(self.db.clone(), self.file.as_deref(), kept, opts, followers).map_err(ApiError::internal)?;
+        tracing::info!(replicas = %p.opts.replicas.join(", "), write_acks = p.opts.acks.name(), "primary: ships to these replicas from now on");
+        Ok(p)
     }
 
     fn term(&self) -> u64 {
@@ -590,7 +719,8 @@ impl Primary {
             return;
         }
         tracing::error!(term = self.term(), replaced_by = term, "a primary of a newer term replaced this one, which takes no more writes and serves no reads");
-        let kept = Kept { id: self.id.clone(), follows: None, replaced_by: Some(term) };
+        // It starts again as a replica of the primary that replaced it.
+        let kept = Kept { id: self.id.clone(), follows: None, replaced_by: Some(term), role: Some(KeptRole::Replica) };
         if let Err(e) = kept.save(self.file.as_deref()) {
             tracing::error!(error = %e, "could not keep that another primary replaced this one");
         }
@@ -812,6 +942,16 @@ async fn ship(p: Weak<Primary>, k: usize) {
     loop {
         let Some(p) = p.upgrade() else { return };
         let f = &p.followers[k];
+        // Another primary of this database ships to it now.
+        if f.owner.load(Ordering::Relaxed) != p.gen {
+            return;
+        }
+        // A shipper of the primary this one replaced is sending it a copy.
+        if f.copying.load(Ordering::Relaxed) && next.is_none() && _hold.is_none() {
+            drop(p);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
         if f.diverged.swap(false, Ordering::Relaxed) {
             must_copy = true;
             round = None;
@@ -1132,7 +1272,11 @@ impl Follow {
         if db.storage().numbering().is_none() {
             return Err("a replica numbers its writes as its primary does: start it with --seq-no".into());
         }
-        let kept = Kept::open(file)?;
+        let mut kept = Kept::open(file)?;
+        if kept.role != Some(KeptRole::Replica) {
+            kept.role = Some(KeptRole::Replica);
+            kept.save(file).map_err(|e| format!("keep the replication role: {e}"))?;
+        }
         let committed = Arc::new(watch::channel(db.storage().numbering().map_or(0, |n| n.seq)).0);
         let hook = committed.clone();
         db.storage().on_commit(move |n| {
@@ -1252,7 +1396,7 @@ impl Follow {
         tokio::task::spawn_blocking(move || crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.storage().begin_term(term).map_err(ApiError::from)))
             .await
             .map_err(ApiError::internal)??;
-        let next = Kept { id: kept.id.clone(), ..Kept::default() };
+        let next = Kept { id: kept.id.clone(), role: Some(KeptRole::Primary { replicas: opts.replicas.clone(), acks: opts.acks }), ..Kept::default() };
         next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the replication id: {e}")))?;
         *kept = next.clone();
         let at = self.db.storage().numbering().unwrap_or_default();
@@ -1343,7 +1487,7 @@ impl Follow {
             }
             Some((_, t)) if *t == term => {}
             _ => {
-                let next = Kept { id: kept.id.clone(), follows: Some((primary.to_string(), term)), replaced_by: None };
+                let next = Kept { id: kept.id.clone(), follows: Some((primary.to_string(), term)), replaced_by: None, role: Some(KeptRole::Replica) };
                 next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the primary followed: {e}")))?;
                 *kept = next;
             }

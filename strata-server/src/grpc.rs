@@ -93,10 +93,11 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 /// for the fetch that follows, 4 places keys in slots, 5 reads the writes
 /// a read must see (`min_seq_no`), which a replica waits for, 6 keeps
 /// stream sources' offsets ([`SOURCES_PROTOCOL`]), 7 answers the next
-/// codes of semantic-ID prefixes ([`SIDNEXT_PROTOCOL`]), and 8 counts the
-/// rows of a guard's levels ([`GUARD_PROTOCOL`]).
+/// codes of semantic-ID prefixes ([`SIDNEXT_PROTOCOL`]), 8 counts the
+/// rows of a guard's levels ([`GUARD_PROTOCOL`]), and 9 keeps the cluster
+/// map, every shard's servers, and takes `Configure` ([`CLUSTER_PROTOCOL`]).
 pub const MIN_PROTOCOL: u32 = 1;
-pub const PROTOCOL: u32 = 8;
+pub const PROTOCOL: u32 = 9;
 
 /// The protocol whose writes carry stream sources' offsets
 /// ([`crate::service::op_source`]), and that answers `Sources`.
@@ -107,6 +108,11 @@ pub const SIDNEXT_PROTOCOL: u32 = 7;
 
 /// The protocol of `GuardCounts`, the rows of a guard's levels.
 pub const GUARD_PROTOCOL: u32 = 8;
+
+/// The protocol of the cluster map ([`crate::slots::SlotMap::replicas`]):
+/// `Slots` asked without a map answers the shard's, and `Configure` sets a
+/// server's part in replication.
+pub const CLUSTER_PROTOCOL: u32 = 9;
 
 /// A write's answer ([`crate::service::Written`]).
 pub fn write_response(w: crate::service::Written) -> pb::WriteResponse {
@@ -199,7 +205,7 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 /// cluster share), writes a write or admin key, the rest any key.
 fn may_call<T>(req: &Request<T>, method: &str) -> Result<(), Status> {
     let who = req.extensions().get::<Principal>().cloned().unwrap_or_else(Principal::open);
-    let internal = matches!(method, "Replicate" | "Restore" | "Verify" | "Slots");
+    let internal = matches!(method, "Replicate" | "Restore" | "Verify" | "Slots" | "Configure");
     if internal && !who.root {
         return Err(Status::permission_denied(format!("{method} is a call between the servers of a cluster: it needs the token they share, not a key ({:?})", who.name)));
     }
@@ -416,9 +422,26 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn slots(&self, req: Request<pb::SlotsRequest>) -> Result<Response<pb::SlotsResponse>, Status> {
         self.serve("Slots", req, |svc, r| async move {
-            let j: serde_json::Value = from_json(&r.map_json, "slot map")?;
-            let map = crate::slots::SlotMap::from_json(&j).map_err(ApiError::bad)?;
-            Ok(pb::SlotsResponse { epoch: svc.set_slots(map, r.shard as usize).await? })
+            if !r.map_json.is_empty() {
+                let j: serde_json::Value = from_json(&r.map_json, "slot map")?;
+                let map = crate::slots::SlotMap::from_json(&j).map_err(ApiError::bad)?;
+                svc.set_slots(map, r.shard as usize).await?;
+            }
+            Ok(match svc.slots() {
+                Some((m, shard)) => pb::SlotsResponse { epoch: m.epoch, map_json: serde_json::to_vec(&m.to_json()).unwrap_or_default(), shard: shard as u32 },
+                None => pb::SlotsResponse::default(),
+            })
+        })
+        .await
+    }
+
+    async fn configure(&self, req: Request<pb::ConfigureRequest>) -> Result<Response<pb::ConfigureResponse>, Status> {
+        self.serve("Configure", req, |svc, r| async move {
+            let acks = match r.write_acks.as_str() {
+                "" => None,
+                a => Some(crate::replication::Acks::parse(a).ok_or_else(|| ApiError::bad(format!("write_acks is all, majority or primary, not {a:?}")))?),
+            };
+            svc.configure(r.role(), r.replicas, acks, r.force).await
         })
         .await
     }

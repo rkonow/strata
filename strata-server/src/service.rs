@@ -232,6 +232,10 @@ pub struct Service {
     /// ([`Service::set_slots`]), and the file that keeps them (a new map
     /// is set while its lock is held).
     slots: RwLock<Option<(SlotMap, usize)>>,
+    /// The oldest map epoch under which this shard holds the slots it
+    /// holds now: a coordinator routing by a map that old still reads and
+    /// writes here correctly ([`Service::check_epoch`]).
+    slots_since: AtomicU64,
     slots_file: tokio::sync::Mutex<Option<PathBuf>>,
     /// Its part in replication ([`crate::replication`]), which a replica's
     /// promotion changes ([`Self::promote`]).
@@ -239,8 +243,10 @@ pub struct Service {
     /// How a replica ships once promoted, but for its replicas and
     /// `--write-acks` (none: as [`PrimaryOptions::default`]).
     pub promote_options: Option<PrimaryOptions>,
-    /// Held while a promotion runs.
+    /// Held while a promotion or a change of its part runs.
     promoting: tokio::sync::Mutex<()>,
+    /// Where its part in replication is kept (`<db>.replication`).
+    replication_file: Option<PathBuf>,
 }
 
 /// A server's part in replication.
@@ -318,10 +324,12 @@ impl Service {
             synonyms_file: None,
             backup_dir: None,
             slots: RwLock::new(None),
+            slots_since: AtomicU64::new(0),
             slots_file: tokio::sync::Mutex::new(None),
             replication: RwLock::new(Replication::None),
             promote_options: None,
             promoting: tokio::sync::Mutex::new(()),
+            replication_file: None,
         }
     }
 
@@ -439,6 +447,84 @@ impl Service {
         Ok(answer)
     }
 
+    /// Sets this server's part in replication while it serves
+    /// (`Configure`), kept beside its database: `Primary` ships to
+    /// `replicas` under `acks` (as now when `None`, else all) from now on,
+    /// starting to ship on a standalone server; `Replica` makes a
+    /// standalone server wait for a primary, whose copy replaces its rows
+    /// (refused while it holds rows, unless `force`), or a primary another
+    /// replaced (any primary with `force`) follow the new one;
+    /// `Standalone` ends replication (a replica's only with `force`).
+    /// A replica is made primary by promotion ([`Self::promote`]), not
+    /// here.
+    pub async fn configure(&self, role: pb::Role, replicas: Vec<String>, acks: Option<Acks>, force: bool) -> Result<pb::ConfigureResponse, ApiError> {
+        let _one = self.promoting.lock().await;
+        let db = self.local().cloned().ok_or_else(|| ApiError::bad("a coordinator has no part in replication: configure its shards' servers"))?;
+        let file = self.replication_file.clone();
+        let now = self.replication();
+        let next = match (role, &now) {
+            (pb::Role::Primary, Replication::Primary(p)) => {
+                let acks = acks.unwrap_or(p.acks());
+                match p.replicas() == replicas.as_slice() && p.acks() == acks {
+                    true => None,
+                    false => Some(Replication::Primary(p.reconfigure(replicas, acks)?)),
+                }
+            }
+            (pb::Role::Primary, Replication::None) => {
+                if db.storage().numbering().is_none() {
+                    return Err(ApiError::bad("a primary numbers its writes, and this server's database does not: start it with --seq-no"));
+                }
+                let opts = PrimaryOptions { replicas, acks: acks.unwrap_or_default(), joining: true, ..self.promote_options.clone().unwrap_or_default() };
+                let p = Primary::start(db.clone(), file.as_deref(), opts).map_err(|e| conflict(e))?;
+                tracing::info!(replicas = %p.replicas().join(", "), write_acks = p.acks().name(), "configured: the primary of its shard");
+                Some(Replication::Primary(p))
+            }
+            (pb::Role::Primary, Replication::Replica(_)) => {
+                return Err(conflict("this server is a replica: promote it to make it the primary of a new term (POST /v1/admin/promote)".into()));
+            }
+            (pb::Role::Replica, Replication::Replica(_)) => None,
+            (pb::Role::Replica, Replication::Primary(p)) if p.replaced_by() == 0 && !force => {
+                return Err(conflict("this server is its shard's primary, and no primary replaced it: promote another copy first (or pass force)".into()));
+            }
+            (pb::Role::Replica, _) => {
+                if db.storage().numbering().is_none() {
+                    return Err(ApiError::bad("a replica numbers its writes as its primary does: start it with --seq-no"));
+                }
+                let rows = db.snapshot().n_live_docs();
+                if matches!(now, Replication::None) && rows > 0 && !force {
+                    return Err(conflict(format!("this server holds {rows} rows, which its primary's copy would replace: pass force to drop them")));
+                }
+                let f = Follow::open(db.clone(), file.as_deref()).map_err(ApiError::bad)?;
+                tracing::info!("configured: a replica, which applies what its primary ships");
+                Some(Replication::Replica(Arc::new(f)))
+            }
+            (pb::Role::Standalone, Replication::None) => None,
+            (pb::Role::Standalone, Replication::Replica(_)) if !force => {
+                return Err(conflict("this server is a replica: on its own it would take writes its primary does not hold; pass force".into()));
+            }
+            (pb::Role::Standalone, _) => {
+                crate::replication::forget_role(file.as_deref()).map_err(|e| ApiError::internal(format!("keep the replication role: {e}")))?;
+                tracing::info!("configured: standalone, replicating no more");
+                Some(Replication::None)
+            }
+        };
+        if let Some(r) = next {
+            *self.replication.write().unwrap_or_else(|e| e.into_inner()) = r;
+        }
+        let n = db.storage().numbering().unwrap_or_default();
+        let (replicas, write_acks) = match &self.replication() {
+            Replication::Primary(p) => (p.replicas().to_vec(), p.acks().name().to_string()),
+            _ => (Vec::new(), String::new()),
+        };
+        Ok(pb::ConfigureResponse { role: self.role() as i32, term: n.term, seq_no: n.seq, replicas, write_acks })
+    }
+
+    /// Keeps its part in replication in `path` (`<db>.replication`), for
+    /// [`Self::configure`].
+    pub fn keep_replication_in(&mut self, path: PathBuf) {
+        self.replication_file = Some(path);
+    }
+
     /// Keeps the slot map a coordinator gives this shard in `path`, and
     /// reads the one kept there, if any. Without a file, the map lasts
     /// until the server stops.
@@ -447,6 +533,7 @@ impl Service {
             let j: Json = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())).map_err(|e| format!("{}: {e}", path.display()))?;
             let map = SlotMap::from_json(&j["map"]).map_err(|e| format!("{}: {e}", path.display()))?;
             let shard = j["shard"].as_u64().map(|s| s as usize).filter(|&s| s < map.shards()).ok_or_else(|| format!("{}: no shard of the map", path.display()))?;
+            *self.slots_since.get_mut() = j["since"].as_u64().unwrap_or(map.epoch).min(map.epoch);
             *self.slots.get_mut().unwrap_or_else(|e| e.into_inner()) = Some((map, shard));
         }
         *self.slots_file.get_mut() = Some(path);
@@ -456,6 +543,15 @@ impl Service {
     /// The epoch of this shard's slot map; 0 without one.
     pub fn slot_epoch(&self) -> u64 {
         self.slots.read().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |(m, _)| m.epoch)
+    }
+
+    /// The coordinator this server is, for the calls that change the
+    /// cluster; a database refuses them (400).
+    pub fn coordinator(&self) -> Result<&Arc<Coordinator>, ApiError> {
+        match &self.backend {
+            Backend::Cluster(c) => Ok(c),
+            Backend::Local(_) => Err(ApiError::bad("this server is a database, not a coordinator (--shards): change the cluster through its coordinator")),
+        }
     }
 
     /// This shard's slot map and its place in it, if a coordinator gave one.
@@ -468,7 +564,10 @@ impl Service {
     /// (409), as is another map of the same epoch. Every row here must be
     /// in the shard's slots, as no rows move between shards yet: a shard
     /// loaded by another map, or by the hash before slots, refuses the map
-    /// (409) until it is loaded again. Returns the epoch now held.
+    /// (409) until it is loaded again. A map that leaves the shard its
+    /// slots (another shard's, or servers, changed) keeps serving
+    /// coordinators that route by the one before. Returns the epoch now
+    /// held.
     pub async fn set_slots(&self, map: SlotMap, shard: usize) -> Result<u64, ApiError> {
         if shard >= map.shards() {
             return Err(ApiError::bad(format!("shard {shard} of a slot map of {} shards", map.shards())));
@@ -491,7 +590,12 @@ impl Service {
                 };
             }
         }
-        if !held.as_ref().is_some_and(|(m, s)| *s == shard && m.same_slots(&map, shard)) {
+        let same = held.as_ref().is_some_and(|(m, s)| map.same_slots_as(shard, m, *s));
+        let since = match same {
+            true => self.slots_since.load(Ordering::Relaxed).min(map.epoch),
+            false => map.epoch,
+        };
+        if !same {
             let m = map.clone();
             let elsewhere = tokio::task::spawn_blocking(move || rows_elsewhere(&db, &m, shard)).await.map_err(ApiError::internal)??;
             if let Some((n, key)) = elsewhere {
@@ -505,25 +609,29 @@ impl Service {
             }
         }
         if let Some(path) = &*file {
-            save_slots(path, &map, shard).map_err(|e| ApiError::internal(format!("keep the slot map in {}: {e}", path.display())))?;
+            save_slots(path, &map, shard, since).map_err(|e| ApiError::internal(format!("keep the slot map in {}: {e}", path.display())))?;
         }
         let epoch = map.epoch;
-        *self.slots.write().unwrap_or_else(|e| e.into_inner()) = Some((map, shard));
+        let mut held = self.slots.write().unwrap_or_else(|e| e.into_inner());
+        self.slots_since.store(since, Ordering::Relaxed);
+        *held = Some((map, shard));
         Ok(epoch)
     }
 
     /// Checks a request's slot map epoch against this shard's: 0 (a
-    /// request not from a coordinator with a map) passes; an older epoch
-    /// is refused (409), as the coordinator routes by a map the shards
-    /// left; a newer one, or one this shard lacks, is refused as
-    /// unavailable (503), so that the coordinator asks again and sends its
-    /// map.
+    /// request not from a coordinator with a map) passes, as does an
+    /// older epoch under which this shard held the slots it holds;
+    /// another older epoch is refused (409), as the coordinator routes by
+    /// a map the shards left; a newer one, or one this shard lacks, is
+    /// refused as unavailable (503), so that the coordinator asks again
+    /// and sends its map.
     pub fn check_epoch(&self, epoch: u64) -> Result<(), ApiError> {
         if epoch == 0 {
             return Ok(());
         }
         match self.slot_epoch() {
             e if e == epoch => Ok(()),
+            e if e > epoch && epoch >= self.slots_since.load(Ordering::Relaxed) => Ok(()),
             e if e > epoch => Err(conflict(format!("slot map epoch {epoch} is older than this shard's ({e}): the coordinator must load the newer map (--slot-map)"))),
             0 => Err(ApiError { status: 503, message: format!("this shard has no slot map; the request's is epoch {epoch}") }),
             e => Err(ApiError { status: 503, message: format!("this shard has slot map epoch {e}, older than the request's {epoch}") }),
@@ -2476,9 +2584,10 @@ fn rows_elsewhere(db: &Db, map: &SlotMap, shard: usize) -> Result<Option<(usize,
     Ok(out)
 }
 
-/// Writes `map` and `shard` to `path` ([`save_json`]).
-fn save_slots(path: &Path, map: &SlotMap, shard: usize) -> std::io::Result<()> {
-    save_json(path, &json!({"shard": shard, "map": map.to_json()}))
+/// Writes `map`, `shard` and the epoch since which the shard holds its
+/// slots to `path` ([`save_json`]).
+fn save_slots(path: &Path, map: &SlotMap, shard: usize, since: u64) -> std::io::Result<()> {
+    save_json(path, &json!({"shard": shard, "since": since, "map": map.to_json()}))
 }
 
 /// Writes `j` to `path` and syncs it, through a new file renamed over the

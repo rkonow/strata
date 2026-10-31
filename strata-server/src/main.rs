@@ -109,7 +109,9 @@ struct Args {
     #[arg(long, default_value_t = 600)]
     verify_every_s: u64,
     /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
-    /// of one shard joined by '|').
+    /// of one shard joined by '|'). Servers of protocol 9 hold the cluster
+    /// map, which names every shard's servers: the coordinator then routes
+    /// by the newest map they hold, whatever servers this lists.
     #[arg(long, value_delimiter = ',')]
     shards: Vec<String>,
     /// With --shards: ask another replica of a shard when one has not

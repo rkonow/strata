@@ -141,10 +141,11 @@ async fn keys_have_scopes_and_the_audit_log_keeps_what_they_did() {
     assert_eq!(e.code(), tonic::Code::PermissionDenied, "{e}");
     let e = ops.slots(pb::SlotsRequest::default()).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::PermissionDenied, "{e}");
-    // The token gets past the check (and the server then refuses a bad request).
+    // The token gets past the check: a request with no map asks the one
+    // the server holds (none).
     let mut rootc = client("root-token".into()).await;
-    let e = rootc.slots(pb::SlotsRequest::default()).await.unwrap_err();
-    assert_ne!(e.code(), tonic::Code::PermissionDenied, "{e}");
+    let held = rootc.slots(pb::SlotsRequest::default()).await.unwrap().into_inner();
+    assert_eq!((held.epoch, held.map_json.len()), (0, 0));
     let mut wr = client(writer.clone()).await;
     assert!(wr.write(pb::WriteRequest::default()).await.map_or_else(|e| e.code() != tonic::Code::PermissionDenied, |_| true));
     let read2 = new_key(&base, root, "reader2", "read").await;

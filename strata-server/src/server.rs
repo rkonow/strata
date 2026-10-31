@@ -178,7 +178,10 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if (!o.replicas.is_empty() || o.promote) && o.replica {
         return Err("a server is a primary (--replicas, --promote) or a replica (--replica), not both".into());
     }
-    let ship_log_bytes = match replicating {
+    // A server that numbers its writes keeps a log of them to ship, so that
+    // it can become a primary while it serves (`Configure`), and so that
+    // rows moving to another shard catch up from it.
+    let ship_log_bytes = match replicating || o.seq_no {
         true => (if o.ship_log_mb > 0 { o.ship_log_mb } else { 64 }) << 20,
         false => 0,
     };
@@ -199,11 +202,20 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             }
         };
         let schema = c.schema.clone();
-        (Backend::Cluster(Arc::new(c)), schema)
+        let c = Arc::new(c);
+        // Follows the cluster map as admin calls (here or at another
+        // coordinator) change it.
+        c.watch();
+        (Backend::Cluster(c), schema)
     } else {
         let path = o.db.clone().ok_or("pass --db PATH (or --shards to coordinate shard servers)")?;
         slots_file = Some(crate::slots::file_of(&path));
         replication_file = Some(replication::file_of(&path));
+        // A part in replication kept beside the database is taken up again
+        // (`Configure` set it, or a promotion): such a database numbers
+        // its writes, and keeps a log of them.
+        let kept = if path.exists() && !replicating { replication::kept_role(&path)?.0 } else { None };
+        let ship_log_bytes = if kept.is_some() && ship_log_bytes == 0 { (if o.ship_log_mb > 0 { o.ship_log_mb } else { 64 }) << 20 } else { ship_log_bytes };
         if o.copy_from.is_some() && (path.exists() || o.schema.is_none()) {
             return Err("--copy-from fills a new database: pass a --db that does not exist and its --schema".into());
         }
@@ -312,17 +324,38 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         svc.set_media(media_resolver(o)?).map_err(|e| e.message)?;
     }
     // Once loaded: bulk loads are not shipped, so every copy loads the same.
+    if let (Backend::Local(_), Some(file)) = (&svc.backend, &replication_file) {
+        svc.promote_options = Some(PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() });
+        svc.keep_replication_in(file.clone());
+    }
     if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
         // How it ships as a primary, but for its replicas and acks.
         let ships = PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() };
-        if !o.replicas.is_empty() || o.promote {
+        let kept = match replicating {
+            true => (None, false),
+            false => replication::kept_role(db.storage().path())?,
+        };
+        if kept.0.is_some() && db.storage().seq_no().is_none() {
+            return Err(format!("{} keeps a part in replication, but does not number its writes", db.storage().path().display()));
+        }
+        if let (Some(replication::KeptRole::Primary { replicas, acks }), false) = &kept {
+            let opts = PrimaryOptions { replicas: replicas.clone(), acks: *acks, ..ships };
+            let p = Primary::start(db.clone(), Some(file), opts)?;
+            tracing::info!(replicas = %replicas.join(", "), write_acks = acks.name(), "primary, as kept beside the database: ships its writes to its replicas");
+            svc.set_replication(Replication::Primary(p));
+        } else if kept.0.is_some() {
+            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
+            match kept.1 {
+                true => tracing::info!("replica: a primary of a newer term replaced this one, which follows it"),
+                false => tracing::info!("replica, as kept beside the database: applies the writes its primary ships"),
+            }
+        } else if !o.replicas.is_empty() || o.promote {
             let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, promote: o.promote, ..ships };
             let p = Primary::start(db.clone(), Some(file), opts)?;
             tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
             svc.set_replication(Replication::Primary(p));
         } else if o.replica {
             svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
-            svc.promote_options = Some(ships);
             tracing::info!("replica: applies the writes its primary ships, and takes none from clients");
         }
     }

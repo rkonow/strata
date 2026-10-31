@@ -141,6 +141,9 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/vacuum", post(admin_vacuum))
         .route("/v1/admin/verify", post(admin_verify))
         .route("/v1/admin/promote", post(admin_promote))
+        .route("/v1/admin/shards", post(add_shard))
+        .route("/v1/admin/shards/:i", axum::routing::delete(remove_shard))
+        .route("/v1/admin/shards/:i/replicas", post(add_replica).merge(axum::routing::delete(remove_replica)))
         .route("/v1/agent", post(agent_run))
         .route("/v1/queries", get(live_queries))
         .route("/v1/queries/:id", axum::routing::delete(cancel_query))
@@ -1035,6 +1038,57 @@ async fn admin_promote(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         Some(v) => v.as_bool().ok_or_else(|| ApiError::bad("force is true or false"))?,
     };
     Ok(AxJson(app.svc.promote(replicas, acks, force).await?))
+}
+
+/// The gRPC URLs a request names under `key`.
+fn urls(b: &Json, key: &str) -> Result<Vec<String>, ApiError> {
+    let bad = || ApiError::bad(format!("{key} is a list of gRPC URLs (http://host:port)"));
+    match b.get(key) {
+        Some(Json::Array(a)) => a.iter().map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from).ok_or_else(bad)).collect(),
+        _ => Err(bad()),
+    }
+}
+
+fn body_bool(b: &Json, key: &str) -> Result<bool, ApiError> {
+    match b.get(key) {
+        None | Some(Json::Null) => Ok(false),
+        Some(v) => v.as_bool().ok_or_else(|| ApiError::bad(format!("{key} is true or false"))),
+    }
+}
+
+/// `POST /v1/admin/shards {"servers": [...], "write_acks"?}`: a new
+/// shard, holding no slot until slots move to it.
+async fn add_shard(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let servers = urls(&b, "servers")?;
+    let acks = match b.get("write_acks") {
+        None | Some(Json::Null) => Acks::All,
+        Some(v) => v.as_str().and_then(Acks::parse).ok_or_else(|| ApiError::bad("write_acks is all, majority or primary"))?,
+    };
+    let j = app.svc.coordinator()?.add_shard(servers.clone(), acks).await?;
+    let detail = format!("added shard {} served by {}", j["shard"], servers.join(", "));
+    Ok(audited(j, detail))
+}
+
+/// `DELETE /v1/admin/shards/:i`: removes a shard that holds no slot.
+async fn remove_shard(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>) -> Result<Response, ApiError> {
+    let j = app.svc.coordinator()?.remove_shard(i).await?;
+    Ok(audited(j, format!("removed shard {i}")))
+}
+
+/// `POST /v1/admin/shards/:i/replicas {"url", "force"?}`: one more
+/// server for shard `i`, a replica of its primary.
+async fn add_replica(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let url = body_str(&b, "url")?.to_string();
+    let j = app.svc.coordinator()?.add_replica(i, &url, body_bool(&b, "force")?).await?;
+    Ok(audited(j, format!("added {url} to shard {i}")))
+}
+
+/// `DELETE /v1/admin/shards/:i/replicas?url=`: one server fewer for shard
+/// `i`.
+async fn remove_replica(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, Query(q): Params) -> Result<Response, ApiError> {
+    let url = q.get("url").filter(|u| !u.is_empty()).ok_or_else(|| ApiError::bad("url is the gRPC URL of the server to remove (?url=http://host:port)"))?;
+    let j = app.svc.coordinator()?.remove_replica(i, url).await?;
+    Ok(audited(j, format!("removed {url} from shard {i}")))
 }
 
 /// How long `POST /v1/admin/verify` waits for the replicas' digests by

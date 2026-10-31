@@ -592,9 +592,10 @@ async fn coordinator_answers_like_one_database() {
     sql("DELETE FROM products WHERE price = 10".into()).await;
     assert_eq!(count("SELECT COUNT(*) FROM products").await, N as i64);
 
-    // A coordinator over other shards would route keys elsewhere: refused.
-    let e = Coordinator::connect(vec![urls[0].clone()]).await.err().unwrap();
-    assert!(e.status == 409 && e.message.contains("a different slot map of epoch 1, as shard 0 of 3"), "{}", e.message);
+    // A coordinator given one shard finds the others in the cluster map
+    // that shard holds, and routes keys as the first does.
+    let one = cluster(Coordinator::connect(vec![urls[0].clone()]).await.unwrap());
+    assert_eq!(one.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.unwrap().rs.rows[0][0].as_i64(), Some(N as i64));
     // A shard that is down: connecting fails with its address.
     let err = Coordinator::connect(vec![urls[0].clone(), "http://127.0.0.1:1".into()]).await.err().unwrap();
     assert!(err.message.contains("127.0.0.1:1"), "{}", err.message);
@@ -629,7 +630,7 @@ impl pb::strata_server::Strata for Stuck {
         Ok(tonic::Response::new(pb::Empty {}))
     }
     async fn slots(&self, _: tonic::Request<pb::SlotsRequest>) -> Result<tonic::Response<pb::SlotsResponse>, tonic::Status> {
-        Ok(tonic::Response::new(pb::SlotsResponse { epoch: 1 }))
+        Ok(tonic::Response::new(pb::SlotsResponse { epoch: 1, ..Default::default() }))
     }
     async fn replicate(&self, _: tonic::Request<pb::ReplicateRequest>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
@@ -652,6 +653,9 @@ impl pb::strata_server::Strata for Stuck {
     }
     async fn guard_counts(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no guards here"))
+    }
+    async fn configure(&self, _: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
     }
 }
 
@@ -682,7 +686,7 @@ impl pb::strata_server::Strata for Overloaded {
         Ok(tonic::Response::new(pb::Empty {}))
     }
     async fn slots(&self, _: tonic::Request<pb::SlotsRequest>) -> Result<tonic::Response<pb::SlotsResponse>, tonic::Status> {
-        Ok(tonic::Response::new(pb::SlotsResponse { epoch: 1 }))
+        Ok(tonic::Response::new(pb::SlotsResponse { epoch: 1, ..Default::default() }))
     }
     async fn replicate(&self, _: tonic::Request<pb::ReplicateRequest>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
@@ -705,6 +709,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn guard_counts(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no guards here"))
+    }
+    async fn configure(&self, _: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
     }
 }
 
@@ -977,6 +984,10 @@ impl pb::strata_server::Strata for Recording {
     }
     async fn guard_counts(&self, r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
         self.inner.guard_counts(self.read(r)?).await
+    }
+    async fn configure(&self, r: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.configure(r).await
     }
 }
 
@@ -1450,8 +1461,8 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let svc = service(db, "http://unused");
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
-    let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 8, strata::query::ir::VERSION, 0));
+    let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 10 }).await.unwrap().into_inner();
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 9, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1477,9 +1488,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 9, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: 10, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 9"), "{}", e.message());
+    assert!(e.message().contains("protocol 10"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
@@ -1509,7 +1520,9 @@ async fn keys_live_in_their_slots() {
     for svc in &shards {
         urls.push(grpc(svc.clone()).await);
     }
-    let even = SlotMap::even(2, 1);
+    // Servers of protocol 9: the map names each shard's server.
+    let named = |m: &SlotMap| m.clone().with_replicas(urls.iter().map(|u| vec![u.clone()]).collect()).unwrap();
+    let even = named(&SlotMap::even(2, 1));
     let first = cluster(Coordinator::connect(urls.clone()).await.unwrap());
     assert_eq!(first.health().await["slot_epoch"], 1);
     for (s, svc) in shards.iter().enumerate() {
@@ -1537,21 +1550,22 @@ async fn keys_live_in_their_slots() {
     assert_eq!(e.status, 400, "{}", e.message);
     shards[1].write_ops(vec![json!({"op": "upsert", "doc": {"id": theirs, "title": "Lamp"}})], None).await.unwrap();
 
-    // A newer map of the same slots: the coordinator with the older one is
-    // refused, reads and writes alike.
-    let second_map = SlotMap::from_json(&json!({"epoch": 2, "shards": [[[0, 2048]], [[2048, 4096]]]})).unwrap();
+    // A newer map of the same slots: the coordinator with the older one
+    // still reads and writes, since each shard holds the slots it held
+    // under it.
+    let second_map = named(&SlotMap::from_json(&json!({"epoch": 2, "shards": [[[0, 2048]], [[2048, 4096]]]})).unwrap());
     let second = cluster(Coordinator::connect_with(urls.clone(), CoordOptions { slots: Some(second_map.clone()), ..Default::default() }).await.unwrap());
     assert_eq!(second.health().await["slot_epoch"], 2);
-    let e = first.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.err().unwrap();
-    assert!(e.status == 409 && e.message.contains("slot map epoch 1 is older than this shard's (2)"), "{}", e.message);
-    let e = first.write_ops(vec![json!({"op": "delete", "key": "new1"})], None).await.err().unwrap();
-    assert_eq!(e.status, 409, "{}", e.message);
-    assert_eq!(second.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.unwrap().rs.rows[0][0], Value::Int((N + ids.len() + 1) as i64));
-    // An older map is refused when given, too.
-    let e = Coordinator::connect(urls.clone()).await.err().unwrap();
-    assert!(e.status == 409 && e.message.contains("refused slot map epoch 1"), "{}", e.message);
-    let e = Coordinator::connect_with(vec![urls[0].clone()], CoordOptions { slots: Some(second_map.clone()), ..Default::default() }).await.err().unwrap();
-    assert!(e.status == 400 && e.message.contains("2 shards, and --shards 1"), "{}", e.message);
+    assert_eq!(first.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.unwrap().rs.rows[0][0], Value::Int((N + ids.len() + 1) as i64));
+    first.write_ops(vec![json!({"op": "delete", "key": "new1"})], None).await.unwrap();
+    assert_eq!(second.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.unwrap().rs.rows[0][0], Value::Int((N + ids.len()) as i64));
+    // A coordinator connecting takes up the newest map the shards hold,
+    // given the servers of one shard only, too.
+    let third = cluster(Coordinator::connect(urls.clone()).await.unwrap());
+    assert_eq!(third.health().await["slot_epoch"], 2);
+    let fourth = cluster(Coordinator::connect(vec![urls[1].clone()]).await.unwrap());
+    assert_eq!(fourth.health().await["slot_epoch"], 2);
+    assert_eq!(fourth.query(QueryReq { sql: "SELECT COUNT(*) FROM products".into(), ..Default::default() }).await.unwrap().rs.rows[0][0], Value::Int((N + ids.len()) as i64));
 
     // The map outlives the server: a shard opened again reads it back.
     let mut again = Service::new(Backend::Local(Arc::new(create(dir.path(), "again.strata", |_| false))), demo::schema(N), agent_config("http://unused"), 16, Duration::from_secs(10));
@@ -2677,7 +2691,20 @@ async fn conditional_writes_through_a_coordinator() {
     let e = coord.write_ops(set("p0000003", 0), None).await.unwrap_err();
     assert_eq!(e.status, 409, "{}", e.message);
 
-    let replicated = cluster(Coordinator::connect(urls.iter().map(|u| format!("{u}|{u}")).collect()).await.unwrap());
+    // Shards of two copies that each take the shard's writes (copies of
+    // the shards above, but servers of their own: the shards above hold
+    // a cluster map naming one server each).
+    let mut copies = Vec::new();
+    for s in 0..2 {
+        let mut group = Vec::new();
+        for c in 0..2 {
+            let db = create(dir.path(), &format!("c{s}{c}.strata"), |i| i < 300 && shard_of(&key(i), 2) == s);
+            db.storage().start_seq_no().unwrap();
+            group.push(grpc(service(db, "http://unused")).await);
+        }
+        copies.push(group.join("|"));
+    }
+    let replicated = cluster(Coordinator::connect(copies).await.unwrap());
     let e = replicated.write_ops(set("p0000003", 1), None).await.unwrap_err();
     assert!(e.status == 400 && e.message.contains("one replica per shard"), "{}", e.message);
     let e = replicated.query(QueryReq { sql: "SELECT id, seq_no() FROM products LIMIT 3".into(), ..Default::default() }).await.err().unwrap();
