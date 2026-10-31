@@ -11,8 +11,8 @@ main:   787387dd5be9b24e912dee449212e51d7fd29ca4 (main as of PR #8)
 branch: 65d2332 claude/project-thread-v6u255 (65d23327ac8db9d4fa3ef8e11b18e540f70eaef4)
 Build: cargo build --release --bins in each checkout's engram/ (separate target dirs).
 
-Runs (one at a time, main first, under caffeinate -i, ENGRAM_MODELS=/Users/rkonow/code2/bench-data/models, ENGRAM_DISABLE unset)
-data: /Users/rkonow/code2/bench-data/memory/longmemeval_s.jsonl; embedder: static (potion-retrieval-32M); sizes 10000,100000,1000000; default options otherwise
+Runs (one at a time, main first, under caffeinate -i, ENGRAM_MODELS=~/code2/bench-data/models, ENGRAM_DISABLE unset)
+data: ~/code2/bench-data/memory/longmemeval_s.jsonl; embedder: static (potion-retrieval-32M); sizes 10000,100000,1000000; default options otherwise
 Before each run: no cargo/rustc/engram-bench/node build processes, and the 1-minute load average under 3.0.
 Load averages (1, 5, 15 min) at the start and end of each run:
   main scale | 2026-10-15T07:57:06Z | waited 60s | quiet | 2.22 7.58 5.74

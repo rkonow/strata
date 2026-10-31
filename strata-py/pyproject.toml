@@ -7,6 +7,7 @@ name = "strata-db"
 version = "0.1.0"
 description = "Strata from Python: an embedded search database (full text, vectors, graphs, SQL), or a strata-server over HTTP"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = []
 classifiers = ["Programming Language :: Python :: 3", "Programming Language :: Rust"]

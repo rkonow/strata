@@ -2,6 +2,7 @@
 name = "strata-server"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "Strata over the network: HTTP JSON and gRPC, a coordinator over shards, and a query UI"
 
 [dependencies]

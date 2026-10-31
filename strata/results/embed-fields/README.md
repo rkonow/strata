@@ -93,7 +93,7 @@ NFCorpus and SciDocs were prepared for this run with
 
 ## Models
 
-`strata-server fetch-model NAME` into `STRATA_MODELS=/Users/rkonow/code2/strata-models`:
+`strata-server fetch-model NAME` into `STRATA_MODELS=~/code2/strata-models`:
 
 | model | kind | dimensions | model.safetensors |
 |---|---|---|---|
@@ -106,7 +106,7 @@ NFCorpus and SciDocs were prepared for this run with
 From `strata/`, one run at a time:
 
 ```bash
-export STRATA_MODELS=/Users/rkonow/code2/strata-models STRATA_DATA=/Users/rkonow/code2/bench-data/beir
+export STRATA_MODELS=~/code2/strata-models STRATA_DATA=~/code2/bench-data/beir
 cargo build --release --features accelerate --bin strata-embed-eval   # `bert` for the first two runs
 caffeinate -i target/release/strata-embed-eval --dataset D --model M --out results/embed-fields/D-M.json > results/embed-fields/D-M.txt 2>&1
 ```

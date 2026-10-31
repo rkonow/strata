@@ -157,6 +157,9 @@ python3 scripts/reader_eval.py --data /home/user/data/memory/longmemeval_s.jsonl
     --config today=results/structure/context_<...>.jsonl --config oracle=oracle --out results/reader
 ```
 
+The session transcript and `probes/session_probes.json` come from a private
+development session and are not in the repository.
+
 Claude Code with and without Engram, on a project whose earlier sessions
 stated rules, decisions and planned work (`eval/ab`; the held-out
 scenarios are in `eval/ab/scenarios`):

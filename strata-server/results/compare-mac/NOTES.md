@@ -46,7 +46,7 @@ Second pass (this directory):
 ## Commands
 
 ```bash
-export STRATA_WORK=/Users/rkonow/code2/bench-work/k8s-quora   # /data in the cluster
+export STRATA_WORK=~/code2/bench-work/k8s-quora   # /data in the cluster
 C=strata-server/deploy/compare/compare.sh
 $C image
 $C build                                  # Strata: 2 shards, one after the other

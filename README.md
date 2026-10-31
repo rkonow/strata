@@ -193,3 +193,10 @@ Each crate also carries its own design document ([Strata](strata/DESIGN.md), [En
 This is a research prototype, measured carefully but on one machine (an Apple M2 MacBook Air; the model-based runs on an earlier 4-core cloud VM). A Strata database has one writer process (the multi-process writer lock is designed but not built), and `strata-server` serves a database's first table for now; its sharding, replication and agent are new and have been tested, not yet measured at scale. Engram's coding evidence comes from one long session, a handful of live runs and three small A/B projects; the public benchmarks it uses (LongMemEval, LoCoMo) are chat histories, not coding sessions. Each results page lists its own limitations.
 
 The repository was called `rkonow/engram` until October 2026. GitHub redirects the old address, so existing clones keep working.
+
+## Licence
+
+Strata, Engram and everything else in this repository are licensed under the
+[Apache License, Version 2.0](LICENSE). Unless you state otherwise, a
+contribution you submit for inclusion is licensed the same way, with no
+additional terms or conditions.
